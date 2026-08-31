@@ -3423,6 +3423,9 @@ fn main() -> eframe::Result<()> {
         "Marketeer",
         options,
         Box::new(|cc| {
+            if cfg!(target_os = "macos") {
+                cc.egui_ctx.set_zoom_factor(0.6);
+            }
             install_fonts(&cc.egui_ctx);
             match MacroApp::new(cc) {
                 Ok(app) => Ok(Box::new(app)),
