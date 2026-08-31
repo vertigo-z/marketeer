@@ -2,6 +2,8 @@
 
 A personal macro + micro economics command centre. Single-binary desktop app in Rust (egui) that puts markets, budgets, and an AI research analyst in one frameless window — fully local, no accounts, no telemetry.
 
+**Pre-release: Currently only supports Australia**
+
 ## What it does
 
 ### Macro dashboard
@@ -41,14 +43,6 @@ FRED needs a free API key (enter in Settings). Everything else is keyless.
 ## Storage
 
 Everything lives in `~/.economy.db` (SQLite): price history, chat, settings, and all budget data. Delete the file to start fresh.
-
-## Building
-
-```
-cargo run --release
-```
-
-Linux desktop (X11/Wayland). The app draws its own window chrome and starts maximized; minimum size 450x600.
 
 ## Project layout
 
