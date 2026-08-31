@@ -2220,7 +2220,7 @@ impl MacroApp {
                                 .color(egui::Color32::from_rgb(33, 150, 243)),
                         );
                         let selected: String = chat.model.clone();
-                        egui::ComboBox::new("chat_model", selected.clone())
+                        egui::ComboBox::new("chat_model", "")
                             .selected_text(selected)
                             .width(150.0)
                             .show_ui(ui, |ui| {
@@ -2259,20 +2259,19 @@ impl MacroApp {
                             {
                                 *clear = true;
                             }
-                            if !(cfg!(target_os = "macos") && !maximized) {
-                                ui.label(
-                                    egui::RichText::new(format!("{} tok", thousands(chat.tok_total as f64)))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(120, 120, 120)),
-                                )
-                                .on_hover_text("total tokens since cleared");
-                                ui.label(
-                                    egui::RichText::new(fmt_usd(chat.cost_total))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(120, 120, 120)),
-                                )
-                                .on_hover_text("total cost since cleared (USD)");
-                            }
+                            ui.label(
+                                egui::RichText::new(format!("{} tok", thousands(chat.tok_total as f64)))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            )
+                            .on_hover_text("total tokens since cleared");
+                            ui.label(
+                                egui::RichText::new(fmt_usd(chat.cost_total))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            )
+                            .on_hover_text("total cost since cleared (USD)");
+                            
                         });
                     });
                     ui.separator();
@@ -2956,7 +2955,7 @@ impl MacroApp {
             }
             ui.horizontal(|ui| {
                 ui.heading("Dashboard");
-                let combo = egui::ComboBox::new("country_select", self.selected_country.name())
+                let combo = egui::ComboBox::new("country_select", "")
                     .selected_text(self.selected_country.name())
                     .width(140.0)
                     .show_ui(ui, |ui| {
