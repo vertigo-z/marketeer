@@ -490,7 +490,6 @@ struct ChatState {
     busy: bool,
     error: Option<String>,
     model: String,
-    model_custom: String,
     stream_content: String,
     stream_reasoning: String,
     stream_tool_lines: Vec<String>,
@@ -509,7 +508,6 @@ impl Default for ChatState {
             busy: false,
             error: None,
             model: MODEL_PRESETS[0].to_string(),
-            model_custom: String::new(),
             stream_content: String::new(),
             stream_reasoning: String::new(),
             stream_tool_lines: Vec::new(),
@@ -523,12 +521,10 @@ impl Default for ChatState {
 }
 
 fn resolve_model(chat: &ChatState) -> String {
-    if MODEL_PRESETS.contains(&chat.model.as_str()) {
-        chat.model.clone()
-    } else if !chat.model_custom.trim().is_empty() {
-        chat.model_custom.trim().to_string()
-    } else {
+    if chat.model.trim().is_empty() {
         MODEL_PRESETS[0].to_string()
+    } else {
+        chat.model.trim().to_string()
     }
 }
 
@@ -1779,6 +1775,9 @@ enum DialogState {
         id: i64,
         name: String,
     },
+    CustomModel {
+        value: String,
+    },
 }
 
 struct MacroApp {
@@ -1882,17 +1881,8 @@ impl MacroApp {
                     None
                 }
             },
-            model: if stored_model.is_empty() || MODEL_PRESETS.contains(&stored_model.as_str()) {
-                if stored_model.is_empty() {
-                    MODEL_PRESETS[0].to_string()
-                } else {
-                    stored_model.clone()
-                }
-            } else {
-                "custom…".to_string()
-            },
-            model_custom: if stored_model.is_empty() || MODEL_PRESETS.contains(&stored_model.as_str()) {
-                String::new()
+            model: if stored_model.is_empty() {
+                MODEL_PRESETS[0].to_string()
             } else {
                 stored_model
             },
@@ -2213,6 +2203,7 @@ impl MacroApp {
         send: &mut bool,
         clear: &mut bool,
         toggle_max: &mut bool,
+        custom_model: &mut bool,
     ) {
         egui::Frame::group(ui.style())
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
@@ -2228,27 +2219,25 @@ impl MacroApp {
                                 .strong()
                                 .color(egui::Color32::from_rgb(33, 150, 243)),
                         );
-                        let selected: String = if MODEL_PRESETS.contains(&chat.model.as_str()) {
-                            chat.model.clone()
-                        } else {
-                            "custom…".to_string()
-                        };
-                        egui::ComboBox::new("chat_model", selected.clone())
+                        let selected: String = chat.model.clone();
+                        egui::ComboBox::new("chat_model", "")
                             .selected_text(selected)
                             .width(150.0)
                             .show_ui(ui, |ui| {
                                 for m in MODEL_PRESETS {
                                     ui.selectable_value(&mut chat.model, m.to_string(), *m);
                                 }
-                                ui.selectable_value(&mut chat.model, "custom…".to_string(), "custom…");
+                                if ui
+                                    .selectable_label(
+                                        !MODEL_PRESETS.contains(&chat.model.as_str()),
+                                        "custom…",
+                                    )
+                                    .clicked()
+                                {
+                                    *custom_model = true;
+                                    ui.close();
+                                }
                             });
-                        if !MODEL_PRESETS.contains(&chat.model.as_str()) {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut chat.model_custom)
-                                    .desired_width(110.0)
-                                    .hint_text("model id"),
-                            );
-                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let max_label = if maximized { "v" } else { "^" };
                             let max_tip = if maximized {
@@ -2282,6 +2271,7 @@ impl MacroApp {
                                     .color(egui::Color32::from_rgb(120, 120, 120)),
                             )
                             .on_hover_text("total cost since cleared (USD)");
+                            
                         });
                     });
                     ui.separator();
@@ -2965,7 +2955,7 @@ impl MacroApp {
             }
             ui.horizontal(|ui| {
                 ui.heading("Dashboard");
-                let combo = egui::ComboBox::new("country_select", self.selected_country.name())
+                let combo = egui::ComboBox::new("country_select", "")
                     .selected_text(self.selected_country.name())
                     .width(140.0)
                     .show_ui(ui, |ui| {
@@ -3051,6 +3041,7 @@ impl eframe::App for MacroApp {
         let mut chat_send = false;
         let mut chat_clear = false;
         let mut chat_toggle = false;
+        let mut custom_model = false;
         let mut budget_action: Option<BudgetAction> = None;
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
             let tab = self.current_tab.clone();
@@ -3080,6 +3071,7 @@ impl eframe::App for MacroApp {
                     &mut chat_send,
                     &mut chat_clear,
                     &mut chat_toggle,
+                    &mut custom_model,
                 );
                 return;
             }
@@ -3128,6 +3120,7 @@ impl eframe::App for MacroApp {
                     &mut chat_send,
                     &mut chat_clear,
                     &mut chat_toggle,
+                    &mut custom_model,
                 );
             });
         });
@@ -3345,6 +3338,40 @@ impl eframe::App for MacroApp {
                     self.dialog_state = DialogState::ConfirmDeleteCategory { id, name };
                 }
             }
+            DialogState::CustomModel { mut value } => {
+                let mut open = true;
+                let mut save = false;
+                let mut cancel = false;
+                egui::Window::new("Custom Model")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| {
+                        ui.label("Model id:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut value)
+                                .desired_width(280.0)
+                                .hint_text("openai/gpt-4o-mini"),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Use").clicked() {
+                                save = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if save && !value.trim().is_empty() {
+                    self.chat.model = value.trim().to_string();
+                    if let Ok(conn) = self.db.lock() {
+                        config_set(&conn, "llm_model", value.trim());
+                    }
+                } else if open && !cancel {
+                    self.dialog_state = DialogState::CustomModel { value };
+                }
+            }
         }
 
         // Deferred chat actions from the panel
@@ -3356,6 +3383,15 @@ impl eframe::App for MacroApp {
         }
         if chat_send {
             self.send_chat(ctx.clone());
+        }
+        if custom_model {
+            self.dialog_state = DialogState::CustomModel {
+                value: if MODEL_PRESETS.contains(&self.chat.model.as_str()) {
+                    String::new()
+                } else {
+                    self.chat.model.clone()
+                },
+            };
         }
         match budget_action {
             Some(BudgetAction::OpenEdit(id)) => {
@@ -3424,7 +3460,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             if cfg!(target_os = "macos") {
-                cc.egui_ctx.set_zoom_factor(0.6);
+                cc.egui_ctx.set_zoom_factor(0.8);
             }
             install_fonts(&cc.egui_ctx);
             match MacroApp::new(cc) {
