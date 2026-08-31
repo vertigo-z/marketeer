@@ -7,9 +7,9 @@ A personal macro + micro economics command centre. Single-binary desktop app in 
 ---
 
 <p align="middle">
-  <img alt="marketeer dashboard" src="img/marketeer1.png" width="300">
-  <img alt="marketeer budget" src="img/marketeer2.png" width="300">
-  <img alt="marketeer budget" src="img/marketeer3.png" width="300">
+  <img alt="marketeer dashboard" src="img/marketeer1.png" width="400">
+  <img alt="marketeer budget" src="img/marketeer2.png" width="400">
+  <img alt="marketeer budget" src="img/marketeer3.png" width="400">
 </p>
 
 ---
