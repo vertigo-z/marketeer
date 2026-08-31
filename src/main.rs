@@ -496,6 +496,8 @@ struct ChatState {
     stream_tool_lines: Vec<String>,
     usage: Option<Usage>,
     cost_total: f64,
+    tok_total: u64,
+    cancel: Arc<AtomicBool>,
     md_cache: egui_commonmark::CommonMarkCache,
 }
 
@@ -513,6 +515,8 @@ impl Default for ChatState {
             stream_tool_lines: Vec::new(),
             usage: None,
             cost_total: 0.0,
+            tok_total: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
             md_cache: egui_commonmark::CommonMarkCache::default(),
         }
     }
@@ -793,6 +797,7 @@ fn stream_chat_completion(
     body: &serde_json::Value,
     tx: &mpsc::Sender<DataEvent>,
     ctx: &egui::Context,
+    cancel: &AtomicBool,
 ) -> Result<StreamOutcome, String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(600)))
@@ -807,6 +812,9 @@ fn stream_chat_completion(
     let reader = std::io::BufReader::new(resp.into_body().into_reader());
     let mut out = StreamOutcome::default();
     for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let line = line.map_err(|e| e.to_string())?;
         let Some(data) = line.strip_prefix("data:") else { continue };
         let data = data.trim();
@@ -890,6 +898,7 @@ fn run_chat_agent(
     system: String,
     history: Vec<ChatMessage>,
     user_text: String,
+    cancel: Arc<AtomicBool>,
 ) {
     let mut api_messages: Vec<serde_json::Value> =
         vec![serde_json::json!({"role": "system", "content": system})];
@@ -907,7 +916,7 @@ fn run_chat_agent(
     let mut usage_streaming = true;
     let mut usage_sum = Usage::default();
     let mut has_usage = false;
-    for _round in 0..6 {
+    loop {
         let mut body = serde_json::json!({
             "model": cfg.model,
             "messages": api_messages,
@@ -919,7 +928,7 @@ fn run_chat_agent(
         if usage_streaming {
             body["stream_options"] = serde_json::json!({"include_usage": true});
         }
-        let outcome = match stream_chat_completion(&cfg, &body, &tx, &ctx) {
+        let outcome = match stream_chat_completion(&cfg, &body, &tx, &ctx, &cancel) {
             Ok(o) => o,
             Err(e) => {
                 if e.contains("400") {
@@ -940,6 +949,14 @@ fn run_chat_agent(
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(DataEvent::ChatDone {
+                error: None,
+                usage: if has_usage { Some(usage_sum) } else { None },
+            });
+            ctx.request_repaint();
+            return;
+        }
         if let Some(u) = outcome.usage {
             usage_sum.prompt += u.prompt;
             usage_sum.completion += u.completion;
@@ -989,11 +1006,6 @@ fn run_chat_agent(
             }));
         }
     }
-    let _ = tx.send(DataEvent::ChatDone {
-        error: Some("! stopped: max tool rounds reached".into()),
-        usage: if has_usage { Some(usage_sum) } else { None },
-    });
-    ctx.request_repaint();
 }
 
 fn market_system_prompt(
@@ -1078,6 +1090,27 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     reasoning TEXT NOT NULL DEFAULT '',
     tool_log TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budget_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '#FF9800',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    recurring INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS budget_months (
+    category_id INTEGER NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
+    month TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (category_id, month)
+);
+CREATE TABLE IF NOT EXISTS budget_income (
+    month TEXT PRIMARY KEY,
+    income REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS budget_cumulative (
+    month TEXT PRIMARY KEY,
+    value REAL NOT NULL DEFAULT 0
 );
 ";
 
@@ -1189,6 +1222,278 @@ fn db_load_chat(conn: &Connection) -> Vec<ChatMessage> {
 
 fn db_clear_chat(conn: &Connection) {
     conn.execute("DELETE FROM chat_messages", []).ok();
+}
+
+#[derive(Clone)]
+struct BudgetCategory {
+    id: i64,
+    name: String,
+    color: String,
+    recurring: bool,
+}
+
+const BUDGET_DEFAULTS: &[(&str, &str)] = &[
+    ("Housing", "#F44336"),
+    ("Groceries", "#4CAF50"),
+    ("Transport", "#2196F3"),
+    ("Utilities", "#FFEB3B"),
+    ("Dining", "#FF9800"),
+    ("Health", "#E91E63"),
+    ("Entertainment", "#9C27B0"),
+    ("Subscriptions", "#00BCD4"),
+    ("Other", "#9E9E9E"),
+];
+
+fn db_seed_budget(conn: &Connection) {
+    let _ = conn.execute(
+        "ALTER TABLE budget_categories ADD COLUMN recurring INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM budget_categories", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count > 0 {
+        return;
+    }
+    for (i, (name, color)) in BUDGET_DEFAULTS.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO budget_categories (name, color, sort_order) VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, color, i as i64],
+        )
+        .ok();
+    }
+}
+
+fn db_budget_categories(conn: &Connection) -> Vec<BudgetCategory> {
+    let Ok(mut stmt) = conn
+        .prepare("SELECT id, name, color, recurring FROM budget_categories ORDER BY sort_order, id")
+    else {
+        return Vec::new();
+    };
+    stmt.query_map([], |row| {
+        Ok(BudgetCategory {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+            recurring: row.get::<_, i64>(3)? != 0,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+fn db_budget_amount(conn: &Connection, category_id: i64, month: &str) -> f64 {
+    conn.query_row(
+        "SELECT amount FROM budget_months WHERE category_id = ?1 AND month = ?2",
+        rusqlite::params![category_id, month],
+        |r| r.get(0),
+    )
+    .unwrap_or(0.0)
+}
+
+fn db_budget_set_amount(conn: &Connection, category_id: i64, month: &str, amount: f64) {
+    conn.execute(
+        "INSERT INTO budget_months (category_id, month, amount) VALUES (?1, ?2, ?3)
+         ON CONFLICT(category_id, month) DO UPDATE SET amount = excluded.amount",
+        rusqlite::params![category_id, month, amount],
+    )
+    .ok();
+}
+
+fn db_budget_income(conn: &Connection, month: &str) -> f64 {
+    conn.query_row(
+        "SELECT income FROM budget_income WHERE month = ?1",
+        rusqlite::params![month],
+        |r| r.get(0),
+    )
+    .unwrap_or(0.0)
+}
+
+fn db_budget_set_income(conn: &Connection, month: &str, income: f64) {
+    conn.execute(
+        "INSERT INTO budget_income (month, income) VALUES (?1, ?2)
+         ON CONFLICT(month) DO UPDATE SET income = excluded.income",
+        rusqlite::params![month, income],
+    )
+    .ok();
+}
+
+fn db_budget_get_cumulative(conn: &Connection, month: &str) -> f64 {
+    conn.query_row(
+        "SELECT value FROM budget_cumulative WHERE month = ?1",
+        rusqlite::params![month],
+        |r| r.get(0),
+    )
+    .unwrap_or(0.0)
+}
+
+fn db_budget_set_cumulative(conn: &Connection, month: &str, value: f64) {
+    conn.execute(
+        "INSERT INTO budget_cumulative (month, value) VALUES (?1, ?2)
+         ON CONFLICT(month) DO UPDATE SET value = excluded.value",
+        rusqlite::params![month, value],
+    )
+    .ok();
+}
+
+fn db_budget_add_category(conn: &Connection, name: &str, color: &str, recurring: bool) {
+    let next: i64 = conn
+        .query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM budget_categories", [], |r| r.get(0))
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO budget_categories (name, color, sort_order, recurring) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![name, color, next, recurring as i64],
+    )
+    .ok();
+}
+
+const RAINBOW_POOL: &[&str] = &[
+    "#F44336", "#FFEB3B", "#4CAF50", "#2196F3", "#9C27B0", "#E91E63",
+    "#00BCD4", "#795548", "#607D8B", "#8BC34A", "#3F51B5", "#CDDC39",
+    "#009688", "#673AB7", "#FFC107", "#03A9F4", "#D500F9", "#AEEA00",
+    "#FF4081", "#64DD17", "#00B0FF", "#651FFF", "#FFAB00", "#00E5FF",
+    "#D50000", "#304FFE", "#AA00FF", "#263238", "#FFD600",
+];
+
+fn db_budget_rainbow(conn: &Connection) {
+    let cats = db_budget_categories(conn);
+    let n = cats.len();
+    if n == 0 {
+        return;
+    }
+    for (i, c) in cats.iter().enumerate() {
+        let hex = if i < RAINBOW_POOL.len() {
+            RAINBOW_POOL[i].to_string()
+        } else {
+            let extra = i - RAINBOW_POOL.len();
+            let h = (extra as f64 * 137.508) % 360.0;
+            let l = 0.45 + 0.16 * ((extra % 3) as f64);
+            hsl_to_rgb_hex(h, 0.7, l)
+        };
+        conn.execute(
+            "UPDATE budget_categories SET color = ?1 WHERE id = ?2",
+            rusqlite::params![hex, c.id],
+        )
+        .ok();
+    }
+}
+
+fn hsl_to_rgb_hex(h: f64, s: f64, l: f64) -> String {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = (h / 60.0) % 6.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8
+    )
+}
+
+fn db_budget_update_category(conn: &Connection, id: i64, name: &str, color: &str) {
+    conn.execute(
+        "UPDATE budget_categories SET name = ?1, color = ?2 WHERE id = ?3",
+        rusqlite::params![name, color, id],
+    )
+    .ok();
+}
+
+fn db_budget_delete_category(conn: &Connection, id: i64) {
+    conn.execute("DELETE FROM budget_months WHERE category_id = ?1", rusqlite::params![id]).ok();
+    conn.execute("DELETE FROM budget_categories WHERE id = ?1", rusqlite::params![id]).ok();
+}
+
+const PALETTE: &[(&str, egui::Color32)] = &[
+    ("#F44336", egui::Color32::from_rgb(244, 67, 54)),
+    ("#FF9800", egui::Color32::from_rgb(255, 152, 0)),
+    ("#FFEB3B", egui::Color32::from_rgb(255, 235, 59)),
+    ("#4CAF50", egui::Color32::from_rgb(76, 175, 80)),
+    ("#2196F3", egui::Color32::from_rgb(33, 150, 243)),
+    ("#9C27B0", egui::Color32::from_rgb(156, 39, 176)),
+    ("#E91E63", egui::Color32::from_rgb(233, 30, 99)),
+    ("#00BCD4", egui::Color32::from_rgb(0, 188, 212)),
+    ("#FFFFFF", egui::Color32::from_rgb(255, 255, 255)),
+    ("#9E9E9E", egui::Color32::from_rgb(158, 158, 158)),
+];
+
+fn hex_to_color(hex: &str) -> egui::Color32 {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() == 6 {
+        if let Ok(r) = u8::from_str_radix(&h[0..2], 16) {
+            if let Ok(g) = u8::from_str_radix(&h[2..4], 16) {
+                if let Ok(b) = u8::from_str_radix(&h[4..6], 16) {
+                    return egui::Color32::from_rgb(r, g, b);
+                }
+            }
+        }
+    }
+    egui::Color32::GRAY
+}
+
+enum BudgetAction {
+    OpenEdit(i64),
+    OpenDelete(i64),
+}
+
+#[derive(Default)]
+struct BudgetState {
+    categories: Vec<BudgetCategory>,
+    year: i32,
+    month: u32,
+    amounts: HashMap<i64, f64>,
+    income: f64,
+    cumulative: f64,
+    editing_cumulative: bool,
+    count_oneoff: bool,
+    auto_color: bool,
+    cards_h: f32,
+}
+
+impl BudgetState {
+    fn month_str(&self) -> String {
+        format!("{:04}-{:02}", self.year, self.month)
+    }
+
+    fn month_label(&self) -> String {
+        let names = [
+            "January", "February", "March", "April", "May", "June", "July", "August",
+            "September", "October", "November", "December",
+        ];
+        format!("{} {}", names[(self.month.max(1).min(12) - 1) as usize], self.year)
+    }
+
+    fn shift(&mut self, delta: i32) {
+        let m = self.year * 12 + (self.month as i32 - 1) + delta;
+        self.year = m.div_euclid(12);
+        self.month = (m.rem_euclid(12) + 1) as u32;
+        self.editing_cumulative = false;
+    }
+
+    fn reload(&mut self, conn: &Connection) {
+        if self.auto_color {
+            db_budget_rainbow(conn);
+        }
+        self.categories = db_budget_categories(conn);
+        self.amounts.clear();
+        for c in &self.categories {
+            self.amounts.insert(c.id, db_budget_amount(conn, c.id, &self.month_str()));
+        }
+        self.income = db_budget_income(conn, &self.month_str());
+        self.cumulative = db_budget_get_cumulative(conn, &self.month_str());
+    }
+
+    fn total_spend(&self) -> f64 {
+        self.categories.iter().map(|c| self.amounts.get(&c.id).copied().unwrap_or(0.0)).sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1669,35 @@ fn fmt_usd(v: f64) -> String {
     }
 }
 
+fn color_swatch_row(ui: &mut egui::Ui, current: &mut String) {
+    ui.horizontal(|ui| {
+        for (hex, color) in PALETTE {
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(18.0, 18.0),
+                egui::Sense::click(),
+            );
+            ui.painter().rect_filled(rect, 3.0, *color);
+            if *current == *hex {
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if response.clicked() {
+                *current = hex.to_string();
+            }
+            ui.add_space(2.0);
+        }
+    });
+}
+
+fn color_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
+}
+
 fn plot_line(ui: &mut egui::Ui, id: &str, obs: &[(NaiveDate, f64)], width: f32, height: f32) {
     egui_plot::Plot::new(id)
         .width(width)
@@ -1431,6 +1765,20 @@ enum DialogState {
         refresh_mins: String,
     },
     About,
+    AddCategory {
+        name: String,
+        color: String,
+        recurring: bool,
+    },
+    EditCategory {
+        id: i64,
+        name: String,
+        color: String,
+    },
+    ConfirmDeleteCategory {
+        id: i64,
+        name: String,
+    },
 }
 
 struct MacroApp {
@@ -1444,6 +1792,8 @@ struct MacroApp {
     worker: WorkerHandle,
     chat: ChatState,
     chat_maximized: bool,
+    budget: BudgetState,
+    current_tab: String,
     llm_base_url: String,
     llm_key: String,
     status_text: String,
@@ -1495,9 +1845,43 @@ impl MacroApp {
             }
         };
         let llm_key = config_get(&conn, "llm_key");
+        let current_tab = {
+            let t = config_get(&conn, "tab");
+            if t == "Budget" { "Budget".to_string() } else { "Dashboard".to_string() }
+        };
+        db_seed_budget(&conn);
+        let now = chrono::Local::now();
+        let mut budget = BudgetState {
+            year: now.year(),
+            month: now.month(),
+            count_oneoff: config_get(&conn, "count_oneoff") == "1",
+            auto_color: config_get(&conn, "auto_color") == "1",
+            cards_h: 300.0,
+            ..Default::default()
+        };
+        budget.reload(&conn);
         let stored_model = config_get(&conn, "llm_model");
         let chat = ChatState {
             messages: db_load_chat(&conn),
+            tok_total: config_get(&conn, "chat_tok_total").parse().unwrap_or(0),
+            cost_total: config_get(&conn, "chat_cost_total").parse().unwrap_or(0.0),
+            usage: {
+                let prompt: u64 = config_get(&conn, "chat_last_prompt").parse().unwrap_or(0);
+                let completion: u64 =
+                    config_get(&conn, "chat_last_completion").parse().unwrap_or(0);
+                let total: u64 = config_get(&conn, "chat_last_total").parse().unwrap_or(0);
+                let cost_usd: f64 = config_get(&conn, "chat_last_cost").parse().unwrap_or(0.0);
+                if prompt > 0 || completion > 0 || total > 0 {
+                    Some(Usage {
+                        prompt,
+                        completion,
+                        total,
+                        cost_usd,
+                    })
+                } else {
+                    None
+                }
+            },
             model: if stored_model.is_empty() || MODEL_PRESETS.contains(&stored_model.as_str()) {
                 if stored_model.is_empty() {
                     MODEL_PRESETS[0].to_string()
@@ -1537,6 +1921,8 @@ impl MacroApp {
             worker,
             chat,
             chat_maximized: false,
+            budget,
+            current_tab,
             llm_base_url,
             llm_key,
             status_text: "Ready".into(),
@@ -1591,6 +1977,15 @@ impl MacroApp {
                 DataEvent::ChatDone { error, usage } => {
                     if let Some(u) = usage {
                         self.chat.cost_total += u.cost_usd;
+                        self.chat.tok_total += u.total;
+                        if let Ok(conn) = self.db.lock() {
+                            config_set(&conn, "chat_tok_total", &self.chat.tok_total.to_string());
+                            config_set(&conn, "chat_cost_total", &self.chat.cost_total.to_string());
+                            config_set(&conn, "chat_last_prompt", &u.prompt.to_string());
+                            config_set(&conn, "chat_last_completion", &u.completion.to_string());
+                            config_set(&conn, "chat_last_total", &u.total.to_string());
+                            config_set(&conn, "chat_last_cost", &u.cost_usd.to_string());
+                        }
                     }
                     self.chat.usage = usage;
                     match error {
@@ -1658,9 +2053,11 @@ impl MacroApp {
         let history: Vec<ChatMessage> = self.chat.messages[..self.chat.messages.len() - 1].to_vec();
         let system = market_system_prompt(&self.series, &self.specs, self.range, self.country);
         let tx = self.chat_tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.chat.cancel = cancel.clone();
         self.chat.busy = true;
         thread::spawn(move || {
-            run_chat_agent(ctx, tx, cfg, system, history, text);
+            run_chat_agent(ctx, tx, cfg, system, history, text, cancel);
         });
     }
 
@@ -1669,10 +2066,17 @@ impl MacroApp {
         self.chat.error = None;
         self.chat.usage = None;
         self.chat.cost_total = 0.0;
+        self.chat.tok_total = 0;
         self.chat.stream_content.clear();
         self.chat.stream_reasoning.clear();
         self.chat.stream_tool_lines.clear();
         if let Ok(conn) = self.db.lock() {
+            config_set(&conn, "chat_tok_total", "0");
+            config_set(&conn, "chat_cost_total", "0");
+            config_set(&conn, "chat_last_prompt", "0");
+            config_set(&conn, "chat_last_completion", "0");
+            config_set(&conn, "chat_last_total", "0");
+            config_set(&conn, "chat_last_cost", "0");
             db_clear_chat(&conn);
         }
     }
@@ -1743,6 +2147,7 @@ impl MacroApp {
         idx: usize,
         msg: &ChatMessage,
         streaming: bool,
+        usage: Option<&str>,
         cache: &mut egui_commonmark::CommonMarkCache,
     ) {
         ui.vertical(|ui| {
@@ -1783,7 +2188,16 @@ impl MacroApp {
                         ui.label(&msg.content);
                     });
                 } else {
-                    ui.label(egui::RichText::new(prefix).strong().color(color));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(prefix).strong().color(color));
+                        if let Some(u) = usage {
+                            ui.label(
+                                egui::RichText::new(u)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            );
+                        }
+                    });
                     egui_commonmark::CommonMarkViewer::new().show(ui, cache, &msg.content);
                 }
             }
@@ -1836,28 +2250,6 @@ impl MacroApp {
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if chat.cost_total > 0.0 {
-                                ui.label(
-                                    egui::RichText::new(fmt_usd(chat.cost_total))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(120, 120, 120)),
-                                )
-                                .on_hover_text("total cost since cleared (USD)");
-                            }
-                            if let Some(u) = chat.usage {
-                                ui.label(
-                                    egui::RichText::new(format!("{} tok", thousands(u.total as f64)))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(120, 120, 120)),
-                                )
-                                .on_hover_text(format!(
-                                    "last request: in {} / out {} / total {} tokens / cost {}",
-                                    thousands(u.prompt as f64),
-                                    thousands(u.completion as f64),
-                                    thousands(u.total as f64),
-                                    fmt_usd(u.cost_usd)
-                                ));
-                            }
                             let max_label = if maximized { "v" } else { "^" };
                             let max_tip = if maximized {
                                 "restore dashboard"
@@ -1878,76 +2270,503 @@ impl MacroApp {
                             {
                                 *clear = true;
                             }
-                            if chat.busy {
-                                ui.label(
-                                    egui::RichText::new("* working")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(255, 152, 0)),
-                                );
-                            }
+                            ui.label(
+                                egui::RichText::new(format!("{} tok", thousands(chat.tok_total as f64)))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            )
+                            .on_hover_text("total tokens since cleared");
+                            ui.label(
+                                egui::RichText::new(fmt_usd(chat.cost_total))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            )
+                            .on_hover_text("total cost since cleared (USD)");
                         });
                     });
                     ui.separator();
-                    let hist_h = (ui.available_height() - 40.0).max(60.0);
-                    ui.style_mut().url_in_tooltip = true;
-                    egui::ScrollArea::vertical()
-                        .id_salt("chat_history")
-                        .stick_to_bottom(true)
-                        .max_height(hist_h)
-                        .show(ui, |ui| {
-                            let base = chat.messages.len();
-                            for (i, msg) in chat.messages.iter().enumerate() {
-                                Self::chat_message_ui(ui, i, msg, false, &mut chat.md_cache);
-                            }
-                            let live_active = chat.busy
-                                || !chat.stream_content.is_empty()
-                                || !chat.stream_reasoning.is_empty()
-                                || !chat.stream_tool_lines.is_empty();
-                            if live_active {
-                                let live = ChatMessage {
-                                    role: ChatRole::Assistant,
-                                    content: chat.stream_content.clone(),
-                                    reasoning: chat.stream_reasoning.clone(),
-                                    tool_log: chat.stream_tool_lines.clone(),
-                                };
-                                Self::chat_message_ui(ui, base, &live, true, &mut chat.md_cache);
-                                let dots = ".".repeat(((ui.ctx().time() * 2.0) as usize) % 4);
-                                ui.label(
-                                    egui::RichText::new(format!("* thinking{}", dots))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(255, 152, 0)),
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        ui.horizontal(|ui| {
+                            let enter_send = {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut chat.input)
+                                        .desired_width((width - 74.0).max(80.0))
+                                        .hint_text("ask · research · analyse…"),
                                 );
-                            }
-                            if let Some(err) = &chat.error {
-                                ui.label(
-                                    egui::RichText::new(format!("! {}", err))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(244, 67, 54)),
-                                );
+                                let enter =
+                                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if enter {
+                                    resp.request_focus();
+                                }
+                                enter
+                            };
+                            if chat.busy {
+                                if ui
+                                    .add(egui::Button::new(
+                                        egui::RichText::new("x stop")
+                                            .color(egui::Color32::from_rgb(244, 67, 54)),
+                                    ))
+                                    .clicked()
+                                {
+                                    chat.cancel.store(true, Ordering::Relaxed);
+                                }
+                            } else {
+                                let send_clicked = ui.add(egui::Button::new("* send")).clicked();
+                                if (enter_send || send_clicked) && !chat.input.trim().is_empty() {
+                                    *send = true;
+                                }
                             }
                         });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let enter_send = {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut chat.input)
-                                    .desired_width((width - 74.0).max(80.0))
-                                    .hint_text("ask · research · analyse…"),
-                            );
-                            let enter =
-                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if enter {
-                                resp.request_focus();
-                            }
-                            enter
-                        };
-                        let send_clicked = ui.add(egui::Button::new("* send")).clicked();
-                        if (enter_send || send_clicked) && !chat.busy && !chat.input.trim().is_empty() {
-                            *send = true;
-                        }
+                        ui.add_space(4.0);
+                        ui.style_mut().url_in_tooltip = true;
+                        let last_usage: Option<String> = chat.usage.map(|u| {
+                            format!(
+                                "{} tok · {}",
+                                thousands(u.total as f64),
+                                fmt_usd(u.cost_usd)
+                            )
+                        });
+                        let n_msgs = chat.messages.len();
+                        egui::ScrollArea::vertical()
+                            .id_salt("chat_history")
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                for (i, msg) in chat.messages.iter().enumerate() {
+                                    let usage = if i + 1 == n_msgs
+                                        && msg.role == ChatRole::Assistant
+                                        && !chat.busy
+                                    {
+                                        last_usage.as_deref()
+                                    } else {
+                                        None
+                                    };
+                                    Self::chat_message_ui(ui, i, msg, false, usage, &mut chat.md_cache);
+                                }
+                                let base = chat.messages.len();
+                                let live_active = chat.busy
+                                    || !chat.stream_content.is_empty()
+                                    || !chat.stream_reasoning.is_empty()
+                                    || !chat.stream_tool_lines.is_empty();
+                                if live_active {
+                                    let live = ChatMessage {
+                                        role: ChatRole::Assistant,
+                                        content: chat.stream_content.clone(),
+                                        reasoning: chat.stream_reasoning.clone(),
+                                        tool_log: chat.stream_tool_lines.clone(),
+                                    };
+                                    Self::chat_message_ui(ui, base, &live, true, None, &mut chat.md_cache);
+                                    let dots = ".".repeat(((ui.ctx().time() * 2.0) as usize) % 4);
+                                    ui.label(
+                                        egui::RichText::new(format!("* thinking{}", dots))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(255, 152, 0)),
+                                    );
+                                }
+                                if let Some(err) = &chat.error {
+                                    ui.label(
+                                        egui::RichText::new(format!("! {}", err))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(244, 67, 54)),
+                                    );
+                                }
+                                });
+                            });
                     });
                 });
             });
+    }
+
+    fn budget_section(
+        ui: &mut egui::Ui,
+        budget: &mut BudgetState,
+        db: &Arc<Mutex<Connection>>,
+        action: &mut Option<BudgetAction>,
+        grid_id: &str,
+        recurring: bool,
+        per_col: usize,
+    ) {
+        let cats = budget.categories.clone();
+        let filtered: Vec<&BudgetCategory> =
+            cats.iter().filter(|c| c.recurring == recurring).collect();
+        if filtered.is_empty() {
+            return;
+        }
+        ui.label(
+            egui::RichText::new(if recurring { "RECURRING" } else { "ONE-OFF" })
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            for (col, chunk) in filtered.chunks(per_col.max(1)).enumerate() {
+                egui::Grid::new(format!("{}_{}", grid_id, col))
+                    .num_columns(4)
+                    .spacing([8.0, 5.0])
+                    .min_col_width(30.0)
+                    .show(ui, |ui| {
+                        for cat in chunk {
+                            let color = hex_to_color(&cat.color);
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(14.0, 14.0),
+                                egui::Sense::click(),
+                            );
+                            ui.painter().rect_filled(rect, 3.0, color);
+                            if resp.clicked() {
+                                *action = Some(BudgetAction::OpenEdit(cat.id));
+                            }
+                            resp.on_hover_text("edit category");
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(&cat.name).color(color),
+                                    )
+                                    .frame(false)
+                                    .small(),
+                                )
+                                .clicked()
+                            {
+                                *action = Some(BudgetAction::OpenEdit(cat.id));
+                            }
+                            let month = budget.month_str();
+                            let amount = budget
+                                .amounts
+                                .entry(cat.id)
+                                .or_insert(0.0);
+                            let resp = ui.add(
+                                egui::DragValue::new(amount)
+                                    .speed(1.0)
+                                    .prefix("$")
+                                    .range(-1_000_000_000.0..=1_000_000_000.0),
+                            );
+                            if resp.changed() {
+                                if let Ok(conn) = db.lock() {
+                                    db_budget_set_amount(
+                                        &conn,
+                                        cat.id,
+                                        &month,
+                                        *amount,
+                                    );
+                                }
+                            }
+                            if ui
+                                .small_button("x")
+                                .on_hover_text("delete category")
+                                .clicked()
+                            {
+                                *action = Some(BudgetAction::OpenDelete(cat.id));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+    }
+
+    fn budget_screen(
+        ui: &mut egui::Ui,
+        budget: &mut BudgetState,
+        db: &Arc<Mutex<Connection>>,
+        action: &mut Option<BudgetAction>,
+    ) {
+        let spacing = 12.0;
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
+        let left_w = (avail_w * 0.37).max(280.0);
+        let right_w = (avail_w - left_w - spacing - 4.0).max(240.0);
+        let pie_r = ((right_w - 20.0) / 2.0).min(((avail_h - 200.0) / 4.0).max(40.0));
+        let per_col = (((avail_h - 340.0).max(80.0)) / 24.0).floor().max(4.0) as usize;
+        egui::ScrollArea::vertical()
+            .id_salt("budget_window_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(left_w);
+                        ui.set_max_width(left_w);
+                        let spend = budget.total_spend();
+                        let saved = budget.income - spend;
+                        MacroApp::budget_section(ui, budget, db, action, "budget_grid_rec", true, per_col);
+                        ui.add_space(8.0);
+                        MacroApp::budget_section(ui, budget, db, action, "budget_grid_one", false, per_col);
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("Total   {}", fmt_usd(spend))).strong(),
+                        );
+                        let used = ui.min_size().y;
+                        let spring = (avail_h - used - budget.cards_h - 4.0).max(0.0);
+                        ui.add_space(spring);
+                        egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(left_w - 18.0);
+                                ui.label(egui::RichText::new("SPENT THIS MONTH").small().color(egui::Color32::GRAY));
+                                ui.label(
+                                    egui::RichText::new(fmt_usd(spend))
+                                        .size(22.0)
+                                        .strong(),
+                                );
+                            });
+                        ui.add_space(6.0);
+                        let saved_col = if saved >= 0.0 {
+                            egui::Color32::from_rgb(76, 175, 80)
+                        } else {
+                            egui::Color32::from_rgb(244, 67, 54)
+                        };
+                        let saved_txt = if saved < 0.0 {
+                            format!("-{}", fmt_usd(-saved))
+                        } else {
+                            fmt_usd(saved)
+                        };
+                        egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(left_w - 18.0);
+                                ui.label(egui::RichText::new("SAVED THIS MONTH").small().color(egui::Color32::GRAY));
+                                ui.label(
+                                    egui::RichText::new(saved_txt)
+                                        .size(22.0)
+                                        .strong()
+                                        .color(saved_col),
+                                );
+                            });
+                        ui.add_space(6.0);
+                        egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(left_w - 18.0);
+                                ui.label(egui::RichText::new("CUMULATIVE SAVINGS").small().color(egui::Color32::GRAY));
+                                if budget.editing_cumulative {
+                                    let resp = ui.add(
+                                        egui::DragValue::new(&mut budget.cumulative)
+                                            .speed(10.0)
+                                            .prefix("$")
+                                            .range(-1_000_000_000.0..=1_000_000_000.0),
+                                    );
+                                    if resp.changed() {
+                                        if let Ok(conn) = db.lock() {
+                                            db_budget_set_cumulative(
+                                                &conn,
+                                                &budget.month_str(),
+                                                budget.cumulative,
+                                            );
+                                        }
+                                    }
+                                    if resp.lost_focus() {
+                                        budget.editing_cumulative = false;
+                                    }
+                                } else {
+                                    let col = if budget.cumulative >= 0.0 {
+                                        egui::Color32::from_rgb(76, 175, 80)
+                                    } else {
+                                        egui::Color32::from_rgb(244, 67, 54)
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(fmt_usd(budget.cumulative))
+                                                    .size(26.0)
+                                                    .strong()
+                                                    .color(col),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text("click to edit (saved per month)")
+                                        .clicked()
+                                    {
+                                        budget.editing_cumulative = true;
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("as at {}", budget.month_label()))
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                        budget.cards_h = (ui.min_size().y - used - spring).max(0.0);
+            });
+            ui.add_space(spacing);
+            ui.vertical(|ui| {
+                ui.set_min_width(right_w);
+                ui.set_max_width(right_w);
+                let spend = budget.total_spend();
+                let saved = budget.income - spend;
+                ui.label(egui::RichText::new("SAVINGS VS SPENDING").small().color(egui::Color32::GRAY));
+                let slices1 = if budget.income > 0.0 {
+                    if saved >= 0.0 {
+                        vec![
+                            ("Spent".to_string(), spend, egui::Color32::from_rgb(33, 150, 243)),
+                            ("Saved".to_string(), saved, egui::Color32::from_rgb(76, 175, 80)),
+                        ]
+                    } else {
+                        vec![
+                            ("Spent".to_string(), budget.income, egui::Color32::from_rgb(33, 150, 243)),
+                            ("Overspend".to_string(), -saved, egui::Color32::from_rgb(244, 67, 54)),
+                        ]
+                    }
+                } else {
+                    Vec::new()
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                    MacroApp::draw_pie(ui, "pie_savings", pie_r, &slices1, "");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_min_width(2.0 * pie_r);
+                        ui.set_max_width(2.0 * pie_r);
+                        egui::Grid::new("legend_savings")
+                        .num_columns(4)
+                        .spacing([8.0, 3.0])
+                        .show(ui, |ui| {
+                            for (label, value, color) in &slices1 {
+                                color_dot(ui, *color);
+                                ui.label(egui::RichText::new(label).small());
+                                ui.label(egui::RichText::new(fmt_usd(*value)).small());
+                                let pct = if budget.income > 0.0 {
+                                    value / budget.income * 100.0
+                                } else {
+                                    0.0
+                                };
+                                ui.label(egui::RichText::new(format!("{:.0}%", pct)).small());
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+                ui.add_space(spacing);
+                ui.separator();
+                ui.add_space(spacing / 2.0);
+                ui.label(egui::RichText::new("SPENDING BY CATEGORY").small().color(egui::Color32::GRAY));
+                let mut slices2: Vec<(String, f64, egui::Color32)> = budget
+                    .categories
+                    .iter()
+                    .filter(|c| c.recurring || budget.count_oneoff)
+                    .map(|c| {
+                        (
+                            c.name.clone(),
+                            budget.amounts.get(&c.id).copied().unwrap_or(0.0),
+                            hex_to_color(&c.color),
+                        )
+                    })
+                    .filter(|(_, v, _)| *v > 0.0)
+                    .collect();
+                slices2.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let cat_spend: f64 = slices2.iter().map(|s| s.1).sum();
+                ui.horizontal(|ui| {
+                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                    MacroApp::draw_pie(ui, "pie_categories", pie_r, &slices2, "");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_min_width(2.0 * pie_r);
+                        ui.set_max_width(2.0 * pie_r);
+                        egui::Grid::new("legend_categories")
+                        .num_columns(8)
+                        .spacing([8.0, 3.0])
+                        .show(ui, |ui| {
+                            for (idx, (label, value, color)) in slices2.iter().enumerate() {
+                                if idx > 0 && idx % 2 == 0 {
+                                    ui.end_row();
+                                }
+                                color_dot(ui, *color);
+                                ui.label(egui::RichText::new(label).small());
+                                ui.label(egui::RichText::new(fmt_usd(*value)).small());
+                                let pct = if cat_spend > 0.0 { value / cat_spend * 100.0 } else { 0.0 };
+                                ui.label(egui::RichText::new(format!("{:.0}%", pct)).small());
+                            }
+                        });
+                    });
+                });
+                if slices2.is_empty() {
+                    ui.label(egui::RichText::new("no spending this month").small().color(egui::Color32::GRAY));
+                }
+            });
+        });
+        });
+    }
+
+    fn draw_pie(
+        ui: &mut egui::Ui,
+        _id: &str,
+        radius: f32,
+        slices: &[(String, f64, egui::Color32)],
+        center_text: &str,
+    ) {
+        let size = radius * 2.0;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let painter = ui.painter();
+        let center = rect.center();
+        let total: f64 = slices.iter().map(|s| s.1).sum();
+        if total <= 0.0 {
+            painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)));
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "no data",
+                egui::FontId::proportional(12.0),
+                egui::Color32::GRAY,
+            );
+            return;
+        }
+        let tau = std::f32::consts::TAU;
+        let start = -std::f32::consts::FRAC_PI_2;
+        let mut a0 = start;
+        let mut hovered: Option<(String, f64, egui::Color32)> = None;
+        for (label, value, color) in slices {
+            let frac = (*value / total) as f32;
+            let a1 = a0 + frac * tau;
+            let segs = (((a1 - a0) / tau) * 96.0).ceil().max(2.0) as usize;
+            let mut pts = vec![center];
+            for s in 0..=segs {
+                let ang = a0 + (a1 - a0) * (s as f32 / segs as f32);
+                pts.push(center + radius * egui::vec2(ang.cos(), ang.sin()));
+            }
+            painter.add(egui::Shape::convex_polygon(
+                pts,
+                *color,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 40, 40)),
+            ));
+            if response.hovered() {
+                if let Some(p) = response.interact_pointer_pos() {
+                    let d = p - center;
+                    if d.length() <= radius {
+                        let mut rel = d.angle() - start;
+                        while rel < 0.0 {
+                            rel += tau;
+                        }
+                        let slice_span = a1 - start;
+                        if rel < slice_span {
+                            hovered = Some((label.clone(), *value, *color));
+                        }
+                    }
+                }
+            }
+            a0 = a1;
+        }
+        if !center_text.is_empty() {
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                center_text,
+                egui::FontId::monospace(radius * 0.34),
+                egui::Color32::WHITE,
+            );
+        }
+        if let Some((label, value, _)) = hovered {
+            let total_f = total;
+            response.on_hover_text(format!(
+                "{} — {} ({:.1}%)",
+                label,
+                fmt_usd(value),
+                value / total_f * 100.0
+            ));
+        }
     }
 
     fn show_title_bar(&mut self, ui: &mut egui::Ui) {
@@ -2009,6 +2828,59 @@ impl MacroApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Dashboard").clicked() {
+                        self.current_tab = "Dashboard".into();
+                        if let Ok(conn) = self.db.lock() {
+                            config_set(&conn, "tab", "Dashboard");
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Budget").clicked() {
+                        self.current_tab = "Budget".into();
+                        if let Ok(conn) = self.db.lock() {
+                            config_set(&conn, "tab", "Budget");
+                        }
+                        self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("Budget", |ui| {
+                        if ui
+                            .checkbox(&mut self.budget.count_oneoff, "count one-off in spending")
+                            .changed()
+                        {
+                            if let Ok(conn) = self.db.lock() {
+                                config_set(
+                                    &conn,
+                                    "count_oneoff",
+                                    if self.budget.count_oneoff { "1" } else { "0" },
+                                );
+                            }
+                        }
+                        let color_label = if self.budget.auto_color {
+                            "auto color-sort: ON"
+                        } else {
+                            "auto color-sort: OFF"
+                        };
+                        if ui.button(color_label).clicked() {
+                            self.budget.auto_color = !self.budget.auto_color;
+                            if let Ok(conn) = self.db.lock() {
+                                config_set(
+                                    &conn,
+                                    "auto_color",
+                                    if self.budget.auto_color { "1" } else { "0" },
+                                );
+                            }
+                            if self.budget.auto_color {
+                                if let Ok(conn) = self.db.lock() {
+                                    db_budget_rainbow(&conn);
+                                }
+                                self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
+                            }
+                        }
+                    });
+                });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
                         self.dialog_state = DialogState::About;
@@ -2034,6 +2906,63 @@ impl MacroApp {
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("controls").show(ui, |ui| {
+            if self.current_tab == "Budget" {
+                ui.horizontal(|ui| {
+                    ui.heading("Budget");
+                    if ui.button("<").clicked() {
+                        self.budget.shift(-1);
+                        if let Ok(conn) = self.db.lock() {
+                            self.budget.reload(&conn);
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(self.budget.month_label()).strong(),
+                    );
+                    if ui.button(">").clicked() {
+                        self.budget.shift(1);
+                        if let Ok(conn) = self.db.lock() {
+                            self.budget.reload(&conn);
+                        }
+                    }
+                    ui.add_space(14.0);
+                    ui.label("Income:");
+                    let mut income = self.budget.income;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut income)
+                                .speed(10.0)
+                                .prefix("$")
+                                .range(0.0..=10_000_000.0),
+                        )
+                        .changed()
+                    {
+                        if let Ok(conn) = self.db.lock() {
+                            db_budget_set_income(&conn, &self.budget.month_str(), income);
+                        }
+                        self.budget.income = income;
+                    }
+                    ui.add_space(14.0);
+                    if ui.button("+ Category").clicked() {
+                        self.dialog_state = DialogState::AddCategory {
+                            name: String::new(),
+                            color: "#2196F3".into(),
+                            recurring: true,
+                        };
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "spend {}  ·  saved {}",
+                                fmt_usd(self.budget.total_spend()),
+                                fmt_usd(self.budget.income - self.budget.total_spend())
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    });
+                });
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.heading("Dashboard");
                 let combo = egui::ComboBox::new("country_select", self.selected_country.name())
@@ -2091,7 +3020,7 @@ impl MacroApp {
                     ui.colored_label(
                         egui::Color32::GRAY,
                         egui::RichText::new(format!(
-                            "{}v0.1.0",
+                            "{}v1.0",
                             if self.last_updated.is_empty() {
                                 String::new()
                             } else {
@@ -2122,13 +3051,23 @@ impl eframe::App for MacroApp {
         let mut chat_send = false;
         let mut chat_clear = false;
         let mut chat_toggle = false;
+        let mut budget_action: Option<BudgetAction> = None;
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
+            let tab = self.current_tab.clone();
             let specs = self.specs.clone();
             let series = &self.series;
             let chat = &mut self.chat;
+            let budget = &mut self.budget;
+            let db = self.db.clone();
             let range = self.range;
             let chat_maximized = self.chat_maximized;
             let spacing = 12.0;
+            if tab == "Budget" {
+                let mut action: Option<BudgetAction> = None;
+                MacroApp::budget_screen(ui, budget, &db, &mut action);
+                budget_action = action;
+                return;
+            }
             if chat_maximized {
                 let chat_w = ui.available_width() - 22.0;
                 let chat_h = ui.available_height() - 2.0;
@@ -2287,6 +3226,115 @@ impl eframe::App for MacroApp {
                     self.dialog_state = DialogState::About;
                 }
             }
+            DialogState::AddCategory {
+                mut name,
+                mut color,
+                mut recurring,
+            } => {
+                let mut open = true;
+                let mut save = false;
+                egui::Window::new("Add Category")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| {
+                        ui.label("Name:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut name)
+                                .desired_width(240.0),
+                        );
+                        ui.add_space(6.0);
+                        ui.label("Color:");
+                        color_swatch_row(ui, &mut color);
+                        ui.horizontal(|ui| {
+                            ui.label("Hex:");
+                            ui.add(egui::TextEdit::singleline(&mut color).desired_width(90.0));
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Type:");
+                            ui.radio_value(&mut recurring, true, "Recurring");
+                            ui.radio_value(&mut recurring, false, "One-off");
+                        });
+                        ui.add_space(8.0);
+                        if ui.button("Add").clicked() {
+                            save = true;
+                        }
+                    });
+                if save && !name.trim().is_empty() {
+                    if let Ok(conn) = self.db.lock() {
+                        db_budget_add_category(&conn, name.trim(), color.trim(), recurring);
+                    }
+                    self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
+                    self.status_text = format!("Added category: {}", name.trim());
+                } else if open {
+                    self.dialog_state = DialogState::AddCategory { name, color, recurring };
+                }
+            }
+            DialogState::EditCategory {
+                id,
+                mut name,
+                mut color,
+            } => {
+                let mut open = true;
+                let mut save = false;
+                egui::Window::new("Edit Category")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| {
+                        ui.label("Name:");
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(240.0));
+                        ui.add_space(6.0);
+                        ui.label("Color:");
+                        color_swatch_row(ui, &mut color);
+                        ui.horizontal(|ui| {
+                            ui.label("Hex:");
+                            ui.add(egui::TextEdit::singleline(&mut color).desired_width(90.0));
+                        });
+                        ui.add_space(8.0);
+                        if ui.button("Save").clicked() {
+                            save = true;
+                        }
+                    });
+                if save && !name.trim().is_empty() {
+                    if let Ok(conn) = self.db.lock() {
+                        db_budget_update_category(&conn, id, name.trim(), color.trim());
+                    }
+                    self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
+                } else if open {
+                    self.dialog_state = DialogState::EditCategory { id, name, color };
+                }
+            }
+            DialogState::ConfirmDeleteCategory { id, name } => {
+                let mut open = true;
+                let mut delete = false;
+                let mut cancel = false;
+                egui::Window::new("Delete Category")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| {
+                        ui.label(format!("Delete '{}' and all its monthly amounts?", name));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Delete").clicked() {
+                                delete = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if delete {
+                    if let Ok(conn) = self.db.lock() {
+                        db_budget_delete_category(&conn, id);
+                    }
+                    self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
+                } else if open && !cancel {
+                    self.dialog_state = DialogState::ConfirmDeleteCategory { id, name };
+                }
+            }
         }
 
         // Deferred chat actions from the panel
@@ -2298,6 +3346,26 @@ impl eframe::App for MacroApp {
         }
         if chat_send {
             self.send_chat(ctx.clone());
+        }
+        match budget_action {
+            Some(BudgetAction::OpenEdit(id)) => {
+                if let Some(c) = self.budget.categories.iter().find(|c| c.id == id) {
+                    self.dialog_state = DialogState::EditCategory {
+                        id,
+                        name: c.name.clone(),
+                        color: c.color.clone(),
+                    };
+                }
+            }
+            Some(BudgetAction::OpenDelete(id)) => {
+                if let Some(c) = self.budget.categories.iter().find(|c| c.id == id) {
+                    self.dialog_state = DialogState::ConfirmDeleteCategory {
+                        id,
+                        name: c.name.clone(),
+                    };
+                }
+            }
+            None => {}
         }
         // Animated "thinking…" dots need periodic repaints while busy
         if self.chat.busy {
@@ -2330,8 +3398,8 @@ fn install_fonts(ctx: &egui::Context) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 700.0])
-            .with_maximized(true)
+            .with_inner_size([1000.0, 1400.0])
+            .with_min_inner_size([800.0, 1200.0])
             .with_title("marketeer")
             .with_decorations(false),
         ..Default::default()
