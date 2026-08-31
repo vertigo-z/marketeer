@@ -3149,7 +3149,12 @@ impl eframe::App for MacroApp {
                     .open(&mut open)
                     .show(&ctx, |ui| {
                         ui.label(egui::RichText::new("DATA").strong());
-                        ui.label("FRED API Key:");
+                        ui.horizontal(|ui| {
+                            ui.label("FRED API Key:");
+                            if ui.small_button("copy").on_hover_text("copy key to clipboard").clicked() {
+                                ui.ctx().copy_text(fred_key.clone());
+                            }
+                        });
                         ui.add(
                             egui::TextEdit::singleline(&mut fred_key)
                                 .desired_width(320.0)
@@ -3165,7 +3170,12 @@ impl eframe::App for MacroApp {
                                 .hint_text("https://openrouter.ai/api/v1"),
                         );
                         ui.add_space(4.0);
-                        ui.label("LLM API Key:");
+                        ui.horizontal(|ui| {
+                            ui.label("LLM API Key:");
+                            if ui.small_button("copy").on_hover_text("copy key to clipboard").clicked() {
+                                ui.ctx().copy_text(llm_key.clone());
+                            }
+                        });
                         ui.add(
                             egui::TextEdit::singleline(&mut llm_key)
                                 .desired_width(320.0)
@@ -3396,10 +3406,15 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    let (init_w, init_h, min_w, min_h) = if cfg!(target_os = "macos") {
+        (600.0, 1000.0, 600.0, 1000.0)
+    } else {
+        (1000.0, 1400.0, 800.0, 1200.0)
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 1400.0])
-            .with_min_inner_size([800.0, 1200.0])
+            .with_inner_size([init_w, init_h])
+            .with_min_inner_size([min_w, min_h])
             .with_title("marketeer")
             .with_decorations(false),
         ..Default::default()
