@@ -4,6 +4,16 @@ A personal macro + micro economics command centre. Single-binary desktop app in 
 
 **Pre-release: Currently only supports Australia**
 
+---
+
+<p align="middle">
+  <img alt="marketeer dashboard" src="img/marketeer1.png" width="300">
+  <img alt="marketeer budget" src="img/marketeer2.png" width="300">
+  <img alt="marketeer budget" src="img/marketeer3.png" width="300">
+</p>
+
+---
+
 ## What it does
 
 ### Macro dashboard
