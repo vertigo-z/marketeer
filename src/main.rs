@@ -2376,11 +2376,12 @@ impl MacroApp {
                         });
                          ui.add_space(4.0);
                          ui.style_mut().url_in_tooltip = true;
-                         egui::ScrollArea::vertical()
+                         egui::ScrollArea::both()
                             .id_salt("chat_history")
                             .auto_shrink([false, false])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width());
                                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 for (i, msg) in chat.messages.iter().enumerate() {
                                     Self::chat_message_ui(ui, i, msg, false, &mut chat.md_cache);
