@@ -2386,7 +2386,7 @@ impl MacroApp {
                                     ui.max_rect().min,
                                     egui::vec2(text_w, ui.max_rect().height()),
                                 );
-                                ui.allocate_new_ui(
+                                ui.scope_builder(
                                     egui::UiBuilder::new()
                                         .max_rect(clamp_rect)
                                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
