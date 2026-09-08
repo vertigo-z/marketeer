@@ -2376,13 +2376,21 @@ impl MacroApp {
                         });
                          ui.add_space(4.0);
                          ui.style_mut().url_in_tooltip = true;
-                         egui::ScrollArea::both()
+                         egui::ScrollArea::vertical()
                             .id_salt("chat_history")
-                            .auto_shrink([false, false])
+                            .auto_shrink([false, true])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
-                                ui.set_max_width(ui.available_width());
-                                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                let text_w = (width - 24.0).max(80.0);
+                                let clamp_rect = egui::Rect::from_min_size(
+                                    ui.max_rect().min,
+                                    egui::vec2(text_w, ui.max_rect().height()),
+                                );
+                                ui.allocate_new_ui(
+                                    egui::UiBuilder::new()
+                                        .max_rect(clamp_rect)
+                                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                                    |ui| {
                                 for (i, msg) in chat.messages.iter().enumerate() {
                                     Self::chat_message_ui(ui, i, msg, false, &mut chat.md_cache);
                                 }
