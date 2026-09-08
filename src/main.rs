@@ -2392,8 +2392,7 @@ impl MacroApp {
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |parent| {
-                let rect = egui::Rect::from_min_size(
-                    parent.next_widget_position(),
+                let (_, rect) = parent.allocate_space(
                     egui::vec2(width, (height - 18.0).max(1.0)),
                 );
                 let mut panel_ui = parent.new_child(
@@ -2548,7 +2547,6 @@ impl MacroApp {
                              });
                     });
                 });
-                parent.allocate_space(rect.size());
             });
     }
 
