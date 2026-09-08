@@ -2188,6 +2188,113 @@ impl MacroApp {
             });
     }
 
+    fn chat_markdown_ui(
+        ui: &mut egui::Ui,
+        text: &str,
+        cache: &mut egui_commonmark::CommonMarkCache,
+    ) {
+        let split_cells = |line: &str| {
+            let line = line.trim();
+            let line = line.strip_prefix('|').unwrap_or(line);
+            let mut cells = Vec::new();
+            let mut cell = String::new();
+            let mut escaped = false;
+            for ch in line.chars() {
+                if ch == '|' && !escaped {
+                    cells.push(cell.trim().to_string());
+                    cell.clear();
+                } else {
+                    cell.push(ch);
+                }
+                escaped = ch == '\\' && !escaped;
+            }
+            if !cell.trim().is_empty() || !line.ends_with('|') {
+                cells.push(cell.trim().to_string());
+            }
+            cells
+        };
+        let width = ui.available_width();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut prose = String::new();
+        let mut fence: Option<(char, usize)> = None;
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim_start();
+            let marker = line.chars().next().unwrap_or(' ');
+            let count = line.chars().take_while(|&ch| ch == marker).count();
+            if (marker == '`' || marker == '~') && count >= 3 {
+                match fence {
+                    None => fence = Some((marker, count)),
+                    Some((ch, len)) if ch == marker && count >= len => fence = None,
+                    _ => {}
+                }
+                prose.push_str(lines[i]);
+                prose.push('\n');
+                i += 1;
+                continue;
+            }
+            if fence.is_none() && i + 1 < lines.len() && lines[i].contains('|') {
+                let header = split_cells(lines[i]);
+                let separator = split_cells(lines[i + 1]);
+                if !header.is_empty() && separator.len() == header.len()
+                    && separator.iter().all(|cell| {
+                        let dashes = cell.trim_matches(':');
+                        !dashes.is_empty() && dashes.chars().all(|ch| ch == '-')
+                    })
+                {
+                    if !prose.is_empty() {
+                        ui.push_id(("prose", i), |ui| {
+                            egui_commonmark::CommonMarkViewer::new().show(ui, cache, &prose);
+                        });
+                        prose.clear();
+                    }
+                    let table_id = i;
+                    let cols = header.len();
+                    let mut rows = vec![header];
+                    i += 2;
+                    while i < lines.len() && !lines[i].trim().is_empty() && lines[i].contains('|') {
+                        let mut row = split_cells(lines[i]);
+                        row.resize(cols, String::new());
+                        rows.push(row);
+                        i += 1;
+                    }
+                    let gap = 6.0_f32.min(width / (cols as f32 * 4.0));
+                    let cell_w = ((width - gap * (cols - 1) as f32) / cols as f32).max(1.0);
+                    for (row_idx, row) in rows.iter().enumerate() {
+                        let top = ui.next_widget_position();
+                        let mut row_h = ui.text_style_height(&egui::TextStyle::Body);
+                        for (col, cell) in row.iter().enumerate() {
+                            let rect = egui::Rect::from_min_size(
+                                top + egui::vec2(col as f32 * (cell_w + gap), 0.0),
+                                egui::vec2(cell_w, f32::INFINITY),
+                            );
+                            let mut cell_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .id_salt(("table", table_id, row_idx, col))
+                                    .max_rect(rect)
+                                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                            );
+                            cell_ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            egui_commonmark::CommonMarkViewer::new().show(&mut cell_ui, cache, cell);
+                            row_h = row_h.max(cell_ui.min_size().y);
+                        }
+                        ui.allocate_space(egui::vec2(width, row_h));
+                        if row_idx == 0 { ui.separator(); }
+                    }
+                    continue;
+                }
+            }
+            prose.push_str(lines[i]);
+            prose.push('\n');
+            i += 1;
+        }
+        if !prose.is_empty() {
+            ui.push_id(("prose", i), |ui| {
+                egui_commonmark::CommonMarkViewer::new().show(ui, cache, &prose);
+            });
+        }
+    }
+
     fn chat_message_ui(
         ui: &mut egui::Ui,
         idx: usize,
@@ -2195,8 +2302,16 @@ impl MacroApp {
         streaming: bool,
         cache: &mut egui_commonmark::CommonMarkCache,
     ) {
-        ui.push_id(format!("msg_{}", idx), |ui| {
-        ui.vertical(|ui| {
+        let width = ui.available_width();
+        let mut message_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("chat_message", idx))
+                .max_rect(ui.available_rect_before_wrap())
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        message_ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        {
+            let ui = &mut message_ui;
             for line in &msg.tool_log {
                 ui.label(
                     egui::RichText::new(line)
@@ -2234,7 +2349,7 @@ impl MacroApp {
                         ui.label(&msg.content);
                     });
                 } else {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(prefix).strong().color(color));
                         if let Some(u) = msg.usage {
                             ui.label(
@@ -2252,11 +2367,11 @@ impl MacroApp {
                             ));
                         }
                     });
-                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, &msg.content);
+                    Self::chat_markdown_ui(ui, &msg.content, cache);
                 }
             }
-        });
-        });
+        }
+        ui.allocate_space(egui::vec2(width, message_ui.min_size().y));
     }
 
     fn chat_panel(
@@ -2270,26 +2385,38 @@ impl MacroApp {
         toggle_max: &mut bool,
         custom_model: &mut bool,
     ) {
-        let width = width.min(ui.available_width());
+        let right = ui.max_rect().right().min(ui.clip_rect().right());
+        let width = width.min((right - ui.next_widget_position().x - 18.0).max(1.0));
         let height = height.min(ui.available_height());
         egui::Frame::group(ui.style())
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
             .inner_margin(egui::Margin::same(8))
-            .show(ui, |ui| {
-                ui.set_min_width(width);
-                ui.set_max_width(width);
-                ui.set_min_height((height - 16.0).max(80.0));
+            .show(ui, |parent| {
+                let rect = egui::Rect::from_min_size(
+                    parent.next_widget_position(),
+                    egui::vec2(width, (height - 18.0).max(1.0)),
+                );
+                let mut panel_ui = parent.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("chat_bounds")
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                panel_ui.set_clip_rect(panel_ui.clip_rect().intersect(rect));
+                panel_ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                let ui = &mut panel_ui;
                 ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new("* AI RESEARCH")
                                 .strong()
                                 .color(egui::Color32::from_rgb(33, 150, 243)),
                         );
                         let selected: String = chat.model.clone();
-                        egui::ComboBox::new("chat_model", "")
+                        egui::ComboBox::from_id_salt("chat_model")
                             .selected_text(selected)
-                            .width(150.0)
+                            .width(150.0_f32.min(width))
+                            .truncate()
                             .show_ui(ui, |ui| {
                                 for m in MODEL_PRESETS {
                                     ui.selectable_value(&mut chat.model, m.to_string(), *m);
@@ -2305,7 +2432,6 @@ impl MacroApp {
                                     ui.close();
                                 }
                             });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let max_label = if maximized { "v" } else { "^" };
                             let max_tip = if maximized {
                                 "restore dashboard"
@@ -2338,8 +2464,6 @@ impl MacroApp {
                                     .color(egui::Color32::from_rgb(120, 120, 120)),
                             )
                             .on_hover_text("total cost since cleared (USD)");
-                            
-                        });
                     });
                     ui.separator();
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -2378,19 +2502,17 @@ impl MacroApp {
                          ui.style_mut().url_in_tooltip = true;
                          egui::ScrollArea::vertical()
                             .id_salt("chat_history")
-                            .auto_shrink([false, true])
+                            .auto_shrink([false, false])
                             .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                let text_w = (width - 24.0).max(80.0);
-                                let clamp_rect = egui::Rect::from_min_size(
-                                    ui.max_rect().min,
-                                    egui::vec2(text_w, ui.max_rect().height()),
-                                );
-                                ui.scope_builder(
+                            .show(ui, |parent| {
+                                let rect = parent.available_rect_before_wrap();
+                                let mut history_ui = parent.new_child(
                                     egui::UiBuilder::new()
-                                        .max_rect(clamp_rect)
+                                        .id_salt("chat_content")
+                                        .max_rect(rect)
                                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                                    |ui| {
+                                );
+                                let ui = &mut history_ui;
                                 for (i, msg) in chat.messages.iter().enumerate() {
                                     Self::chat_message_ui(ui, i, msg, false, &mut chat.md_cache);
                                 }
@@ -2422,10 +2544,11 @@ impl MacroApp {
                                             .color(egui::Color32::from_rgb(244, 67, 54)),
                                     );
                                 }
-                                });
-                            });
+                                parent.allocate_space(egui::vec2(rect.width(), history_ui.min_size().y));
+                             });
                     });
                 });
+                parent.allocate_space(rect.size());
             });
     }
 
@@ -2846,7 +2969,7 @@ impl MacroApp {
                     }
                 });
                 ui.menu_button("Settings", |ui| {
-                     if ui.button("API Keys / Refresh").clicked() {
+                     if ui.button("API Keys").clicked() {
                         let (fred_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
                             .db
                             .lock()
