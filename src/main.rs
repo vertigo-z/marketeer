@@ -2431,6 +2431,7 @@ impl MacroApp {
                                     ui.close();
                                 }
                             });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let max_label = if maximized { "v" } else { "^" };
                             let max_tip = if maximized {
                                 "restore dashboard"
@@ -2451,18 +2452,24 @@ impl MacroApp {
                             {
                                 *clear = true;
                             }
-                            ui.label(
-                                egui::RichText::new(format!("{} tok", thousands(chat.tok_total as f64)))
+                            if !(cfg!(target_os = "macos") && !maximized) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} tok",
+                                        thousands(chat.tok_total as f64)
+                                    ))
                                     .small()
                                     .color(egui::Color32::from_rgb(120, 120, 120)),
-                            )
-                            .on_hover_text("total tokens since cleared");
-                            ui.label(
-                                egui::RichText::new(fmt_usd(chat.cost_total))
-                                    .small()
-                                    .color(egui::Color32::from_rgb(120, 120, 120)),
-                            )
-                            .on_hover_text("total cost since cleared (USD)");
+                                )
+                                .on_hover_text("total tokens since cleared");
+                                ui.label(
+                                    egui::RichText::new(fmt_usd(chat.cost_total))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(120, 120, 120)),
+                                )
+                                .on_hover_text("total cost since cleared (USD)");
+                            }
+                        });
                     });
                     ui.separator();
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -3710,15 +3717,9 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
-    let (init_w, init_h, min_w, min_h) = if cfg!(target_os = "macos") {
-        (600.0, 1000.0, 600.0, 1000.0)
-    } else {
-        (1000.0, 1400.0, 800.0, 1200.0)
-    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([init_w, init_h])
-            .with_min_inner_size([min_w, min_h])
+            .with_inner_size([1200, 1000])
             .with_title("marketeer")
             .with_decorations(false),
         ..Default::default()
@@ -3727,9 +3728,6 @@ fn main() -> eframe::Result<()> {
         "Marketeer",
         options,
         Box::new(|cc| {
-            if cfg!(target_os = "macos") {
-                cc.egui_ctx.set_zoom_factor(0.8);
-            }
             install_fonts(&cc.egui_ctx);
             match MacroApp::new(cc) {
                 Ok(app) => Ok(Box::new(app)),
