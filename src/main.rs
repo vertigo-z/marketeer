@@ -474,6 +474,7 @@ struct ChatMessage {
     content: String,
     reasoning: String,
     tool_log: Vec<String>,
+    usage: Option<Usage>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -493,7 +494,6 @@ struct ChatState {
     stream_content: String,
     stream_reasoning: String,
     stream_tool_lines: Vec<String>,
-    usage: Option<Usage>,
     cost_total: f64,
     tok_total: u64,
     cancel: Arc<AtomicBool>,
@@ -511,7 +511,6 @@ impl Default for ChatState {
             stream_content: String::new(),
             stream_reasoning: String::new(),
             stream_tool_lines: Vec::new(),
-            usage: None,
             cost_total: 0.0,
             tok_total: 0,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1177,18 +1176,22 @@ fn db_save_chat_message(
     content: &str,
     reasoning: &str,
     tool_log: &[String],
+    usage: Option<Usage>,
 ) {
     let now = chrono::Local::now().to_rfc3339();
+    let usage_str = usage
+        .map(|u| format!("{}|{}|{}|{}", u.prompt, u.completion, u.total, u.cost_usd))
+        .unwrap_or_default();
     conn.execute(
-        "INSERT INTO chat_messages (role, content, reasoning, tool_log, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![role, content, reasoning, tool_log.join("\n"), now],
+        "INSERT INTO chat_messages (role, content, reasoning, tool_log, usage, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![role, content, reasoning, tool_log.join("\n"), usage_str, now],
     )
     .ok();
 }
 
 fn db_load_chat(conn: &Connection) -> Vec<ChatMessage> {
-    let Ok(mut stmt) =
-        conn.prepare("SELECT role, content, reasoning, tool_log FROM chat_messages ORDER BY id")
+    let Ok(mut stmt) = conn
+        .prepare("SELECT role, content, reasoning, tool_log, usage FROM chat_messages ORDER BY id")
     else {
         return Vec::new();
     };
@@ -1197,6 +1200,18 @@ fn db_load_chat(conn: &Connection) -> Vec<ChatMessage> {
         let content: String = row.get(1)?;
         let reasoning: String = row.get(2)?;
         let tool_log: String = row.get(3)?;
+        let usage: String = row.get(4)?;
+        let parts: Vec<&str> = usage.split('|').collect();
+        let parsed = if parts.len() == 4 {
+            Some(Usage {
+                prompt: parts[0].parse().unwrap_or(0),
+                completion: parts[1].parse().unwrap_or(0),
+                total: parts[2].parse().unwrap_or(0),
+                cost_usd: parts[3].parse().unwrap_or(0.0),
+            })
+        } else {
+            None
+        };
         Ok(ChatMessage {
             role: if role == "user" {
                 ChatRole::User
@@ -1210,6 +1225,7 @@ fn db_load_chat(conn: &Connection) -> Vec<ChatMessage> {
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            usage: parsed,
         })
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1243,6 +1259,10 @@ const BUDGET_DEFAULTS: &[(&str, &str)] = &[
 fn db_seed_budget(conn: &Connection) {
     let _ = conn.execute(
         "ALTER TABLE budget_categories ADD COLUMN recurring INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN usage TEXT NOT NULL DEFAULT ''",
         [],
     );
     let count: i64 = conn
@@ -1864,23 +1884,6 @@ impl MacroApp {
             messages: db_load_chat(&conn),
             tok_total: config_get(&conn, "chat_tok_total").parse().unwrap_or(0),
             cost_total: config_get(&conn, "chat_cost_total").parse().unwrap_or(0.0),
-            usage: {
-                let prompt: u64 = config_get(&conn, "chat_last_prompt").parse().unwrap_or(0);
-                let completion: u64 =
-                    config_get(&conn, "chat_last_completion").parse().unwrap_or(0);
-                let total: u64 = config_get(&conn, "chat_last_total").parse().unwrap_or(0);
-                let cost_usd: f64 = config_get(&conn, "chat_last_cost").parse().unwrap_or(0.0);
-                if prompt > 0 || completion > 0 || total > 0 {
-                    Some(Usage {
-                        prompt,
-                        completion,
-                        total,
-                        cost_usd,
-                    })
-                } else {
-                    None
-                }
-            },
             model: if stored_model.is_empty() {
                 MODEL_PRESETS[0].to_string()
             } else {
@@ -1971,13 +1974,8 @@ impl MacroApp {
                         if let Ok(conn) = self.db.lock() {
                             config_set(&conn, "chat_tok_total", &self.chat.tok_total.to_string());
                             config_set(&conn, "chat_cost_total", &self.chat.cost_total.to_string());
-                            config_set(&conn, "chat_last_prompt", &u.prompt.to_string());
-                            config_set(&conn, "chat_last_completion", &u.completion.to_string());
-                            config_set(&conn, "chat_last_total", &u.total.to_string());
-                            config_set(&conn, "chat_last_cost", &u.cost_usd.to_string());
                         }
                     }
-                    self.chat.usage = usage;
                     match error {
                         Some(e) => self.chat.error = Some(e),
                         None => {
@@ -1986,6 +1984,7 @@ impl MacroApp {
                                 content: std::mem::take(&mut self.chat.stream_content),
                                 reasoning: std::mem::take(&mut self.chat.stream_reasoning),
                                 tool_log: std::mem::take(&mut self.chat.stream_tool_lines),
+                                usage,
                             };
                             self.chat.messages.push(msg.clone());
                             if let Ok(conn) = self.db.lock() {
@@ -1995,6 +1994,7 @@ impl MacroApp {
                                     &msg.content,
                                     &msg.reasoning,
                                     &msg.tool_log,
+                                    msg.usage,
                                 );
                             }
                         }
@@ -2025,9 +2025,10 @@ impl MacroApp {
                 content: text.clone(),
                 reasoning: String::new(),
                 tool_log: Vec::new(),
+                usage: None,
             });
         if let Ok(conn) = self.db.lock() {
-            db_save_chat_message(&conn, "user", &text, "", &[]);
+            db_save_chat_message(&conn, "user", &text, "", &[], None);
             config_set(&conn, "llm_model", &resolve_model(&self.chat));
         }
         let model = resolve_model(&self.chat);
@@ -2054,7 +2055,6 @@ impl MacroApp {
     fn clear_chat(&mut self) {
         self.chat.messages.clear();
         self.chat.error = None;
-        self.chat.usage = None;
         self.chat.cost_total = 0.0;
         self.chat.tok_total = 0;
         self.chat.stream_content.clear();
@@ -2063,10 +2063,6 @@ impl MacroApp {
         if let Ok(conn) = self.db.lock() {
             config_set(&conn, "chat_tok_total", "0");
             config_set(&conn, "chat_cost_total", "0");
-            config_set(&conn, "chat_last_prompt", "0");
-            config_set(&conn, "chat_last_completion", "0");
-            config_set(&conn, "chat_last_total", "0");
-            config_set(&conn, "chat_last_cost", "0");
             db_clear_chat(&conn);
         }
     }
@@ -2137,9 +2133,9 @@ impl MacroApp {
         idx: usize,
         msg: &ChatMessage,
         streaming: bool,
-        usage: Option<&str>,
         cache: &mut egui_commonmark::CommonMarkCache,
     ) {
+        ui.push_id(format!("msg_{}", idx), |ui| {
         ui.vertical(|ui| {
             for line in &msg.tool_log {
                 ui.label(
@@ -2180,17 +2176,26 @@ impl MacroApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(prefix).strong().color(color));
-                        if let Some(u) = usage {
+                        if let Some(u) = msg.usage {
                             ui.label(
-                                egui::RichText::new(u)
-                                    .small()
-                                    .color(egui::Color32::from_rgb(120, 120, 120)),
-                            );
+                                egui::RichText::new(format!(
+                                    "{} tok · {}",
+                                    thousands(u.total as f64),
+                                    fmt_usd(u.cost_usd)
+                                ))
+                                .small()
+                                .color(egui::Color32::from_rgb(120, 120, 120)),
+                            )
+                            .on_hover_text(format!(
+                                "prompt {} · completion {}",
+                                u.prompt, u.completion
+                            ));
                         }
                     });
                     egui_commonmark::CommonMarkViewer::new().show(ui, cache, &msg.content);
                 }
             }
+        });
         });
     }
 
@@ -2205,6 +2210,8 @@ impl MacroApp {
         toggle_max: &mut bool,
         custom_model: &mut bool,
     ) {
+        let width = width.min(ui.available_width());
+        let height = height.min(ui.available_height());
         egui::Frame::group(ui.style())
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
             .inner_margin(egui::Margin::same(8))
@@ -2307,32 +2314,16 @@ impl MacroApp {
                                 }
                             }
                         });
-                        ui.add_space(4.0);
-                        ui.style_mut().url_in_tooltip = true;
-                        let last_usage: Option<String> = chat.usage.map(|u| {
-                            format!(
-                                "{} tok · {}",
-                                thousands(u.total as f64),
-                                fmt_usd(u.cost_usd)
-                            )
-                        });
-                        let n_msgs = chat.messages.len();
-                        egui::ScrollArea::vertical()
+                         ui.add_space(4.0);
+                         ui.style_mut().url_in_tooltip = true;
+                         egui::ScrollArea::vertical()
                             .id_salt("chat_history")
                             .auto_shrink([false, false])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
                                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 for (i, msg) in chat.messages.iter().enumerate() {
-                                    let usage = if i + 1 == n_msgs
-                                        && msg.role == ChatRole::Assistant
-                                        && !chat.busy
-                                    {
-                                        last_usage.as_deref()
-                                    } else {
-                                        None
-                                    };
-                                    Self::chat_message_ui(ui, i, msg, false, usage, &mut chat.md_cache);
+                                    Self::chat_message_ui(ui, i, msg, false, &mut chat.md_cache);
                                 }
                                 let base = chat.messages.len();
                                 let live_active = chat.busy
@@ -2345,8 +2336,9 @@ impl MacroApp {
                                         content: chat.stream_content.clone(),
                                         reasoning: chat.stream_reasoning.clone(),
                                         tool_log: chat.stream_tool_lines.clone(),
+                                        usage: None,
                                     };
-                                    Self::chat_message_ui(ui, base, &live, true, None, &mut chat.md_cache);
+                                    Self::chat_message_ui(ui, base, &live, true, &mut chat.md_cache);
                                     let dots = ".".repeat(((ui.ctx().time() * 2.0) as usize) % 4);
                                     ui.label(
                                         egui::RichText::new(format!("* thinking{}", dots))
@@ -3080,7 +3072,7 @@ impl eframe::App for MacroApp {
             let avail_w = ui.available_width();
             let avail_h = ui.available_height();
             let card_w = (((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32) - 2.0).max(180.0);
-            let card_h = ((avail_h - spacing * (total_rows as f32 - 1.0)) / total_rows as f32).max(140.0);
+            let card_h = ((avail_h - spacing * total_rows as f32) / total_rows as f32).max(140.0);
             let plot_w = card_w - 16.0;
             let plot_h = (card_h - 84.0).max(30.0);
             let grid_specs = &specs[..specs.len().saturating_sub(1).min(9)];
