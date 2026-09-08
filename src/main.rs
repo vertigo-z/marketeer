@@ -532,6 +532,47 @@ struct LlmConfig {
     base_url: String,
     key: String,
     model: String,
+    brave_key: String,
+}
+
+fn brave_search(key: &str, q: &str) -> Result<String, String> {
+    let url = format!(
+        "https://api.search.brave.com/res/v1/web/search?q={}&count=8",
+        percent_encode_qs(q)
+    );
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .new_agent();
+    let resp = agent
+        .get(&url)
+        .header("X-Subscription-Token", key)
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|e| e.to_string())?;
+    let mut body = String::new();
+    resp.into_body()
+        .into_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    if let Some(results) = v["web"]["results"].as_array() {
+        for (n, r) in results.iter().enumerate() {
+            let title = r["title"].as_str().unwrap_or("").trim();
+            let link = r["url"].as_str().unwrap_or("").trim();
+            let desc = strip_html(r["description"].as_str().unwrap_or(""))
+                .trim()
+                .to_string();
+            if !title.is_empty() && !link.is_empty() {
+                out.push_str(&format!("{}. {} — {}\n   {}\n", n + 1, title, link, desc));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(no results parsed — try web_fetch on a known URL)");
+    }
+    Ok(out)
 }
 
 fn http_get_ua(url: &str, timeout_secs: u64) -> Result<String, String> {
@@ -715,18 +756,22 @@ fn parse_ddg_results(body: &str) -> String {
     out
 }
 
-fn execute_chat_tool(name: &str, args: &serde_json::Value) -> (String, String) {
+fn execute_chat_tool(name: &str, args: &serde_json::Value, brave_key: &str) -> (String, String) {
     match name {
         "web_search" => {
             let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let line = format!("↳ web_search \"{}\"", q);
-            let url = format!(
-                "https://html.duckduckgo.com/html/?q={}",
-                percent_encode_qs(q)
-            );
-            let res = http_get_ua(&url, 20)
-                .map(|b| parse_ddg_results(&b))
-                .unwrap_or_else(|e| format!("search failed: {}", e));
+            let key = brave_key.trim();
+            let res = if !key.is_empty() {
+                brave_search(key, q)
+            } else {
+                let url = format!(
+                    "https://html.duckduckgo.com/html/?q={}",
+                    percent_encode_qs(q)
+                );
+                http_get_ua(&url, 20).map(|b| parse_ddg_results(&b))
+            }
+            .unwrap_or_else(|e| format!("search failed: {}", e));
             (line, res)
         }
         "web_fetch" => {
@@ -753,7 +798,7 @@ fn chat_tools_json() -> serde_json::Value {
     serde_json::json!([
         {"type":"function","function":{
             "name":"web_search",
-            "description":"Search the web (DuckDuckGo). Returns numbered titles, URLs and snippets.",
+            "description":"Search the web (Brave Search API when a key is set, else DuckDuckGo). Returns numbered titles, URLs and snippets.",
             "parameters":{"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]}}},
         {"type":"function","function":{
             "name":"web_fetch",
@@ -990,7 +1035,7 @@ fn run_chat_agent(
                 continue;
             }
             let args = serde_json::from_str::<serde_json::Value>(&t.args).unwrap_or_default();
-            let (line, result) = execute_chat_tool(&t.name, &args);
+            let (line, result) = execute_chat_tool(&t.name, &args, &cfg.brave_key);
             let _ = tx.send(DataEvent::ChatToolLine { line });
             ctx.request_repaint();
             let trunc: String = result.chars().take(6000).collect();
@@ -1779,6 +1824,7 @@ enum DialogState {
         llm_key: String,
         llm_model: String,
         refresh_mins: String,
+        brave_key: String,
     },
     About,
     AddCategory {
@@ -1815,6 +1861,8 @@ struct MacroApp {
     current_tab: String,
     llm_base_url: String,
     llm_key: String,
+    brave_key: String,
+    key_prompt: Option<(String, String, String)>,
     status_text: String,
     dialog_state: DialogState,
     range: Range,
@@ -1864,6 +1912,15 @@ impl MacroApp {
             }
         };
         let llm_key = config_get(&conn, "llm_key");
+        let brave_key = config_get(&conn, "brave_key");
+        let key_prompt = if keys.fred.trim().is_empty()
+            && llm_key.trim().is_empty()
+            && brave_key.trim().is_empty()
+        {
+            Some((String::new(), String::new(), String::new()))
+        } else {
+            None
+        };
         let current_tab = {
             let t = config_get(&conn, "tab");
             if t == "Budget" { "Budget".to_string() } else { "Dashboard".to_string() }
@@ -1918,6 +1975,8 @@ impl MacroApp {
             current_tab,
             llm_base_url,
             llm_key,
+            brave_key,
+            key_prompt,
             status_text: "Ready".into(),
             dialog_state: DialogState::None,
             range,
@@ -2040,6 +2099,7 @@ impl MacroApp {
             base_url: self.llm_base_url.clone(),
             key: self.llm_key.clone(),
             model,
+            brave_key: self.brave_key.clone(),
         };
         let history: Vec<ChatMessage> = self.chat.messages[..self.chat.messages.len() - 1].to_vec();
         let system = market_system_prompt(&self.series, &self.specs, self.range, self.country);
@@ -2777,8 +2837,8 @@ impl MacroApp {
                     }
                 });
                 ui.menu_button("Settings", |ui| {
-                    if ui.button("API Keys / Refresh").clicked() {
-                        let (fred_key, llm_base_url, llm_key, llm_model, refresh_mins) = self
+                     if ui.button("API Keys / Refresh").clicked() {
+                        let (fred_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
                             .db
                             .lock()
                             .ok()
@@ -2789,6 +2849,7 @@ impl MacroApp {
                                     config_get(&conn, "llm_key"),
                                     config_get(&conn, "llm_model"),
                                     config_get(&conn, "refresh_mins"),
+                                    config_get(&conn, "brave_key"),
                                 )
                             })
                             .unwrap_or_else(|| {
@@ -2798,6 +2859,7 @@ impl MacroApp {
                                     String::new(),
                                     String::new(),
                                     "1".into(),
+                                    String::new(),
                                 )
                             });
                         self.dialog_state = DialogState::Settings {
@@ -2806,6 +2868,7 @@ impl MacroApp {
                             llm_key,
                             llm_model,
                             refresh_mins,
+                            brave_key,
                         };
                         ui.close();
                     }
@@ -2994,6 +3057,68 @@ impl MacroApp {
         });
     }
 
+    fn show_key_prompt(&mut self, ui: &mut egui::Ui) {
+        let mut done = false;
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(16.0);
+            ui.heading("API Keys");
+            ui.label("Optional — used for macro data, AI research and web search.");
+            ui.add_space(10.0);
+            let Some((fred, llm, brave)) = self.key_prompt.as_mut() else {
+                return;
+            };
+            ui.label("FRED API key (macro data):");
+            ui.add(
+                egui::TextEdit::singleline(fred)
+                    .desired_width(320.0)
+                    .password(true),
+            );
+            ui.add_space(6.0);
+            ui.label("LLM API key (AI research):");
+            ui.add(
+                egui::TextEdit::singleline(llm)
+                    .desired_width(320.0)
+                    .password(true),
+            );
+            ui.add_space(6.0);
+            ui.label("Brave Search API key (web search):");
+            ui.add(
+                egui::TextEdit::singleline(brave)
+                    .desired_width(320.0)
+                    .password(true),
+            );
+            ui.add_space(10.0);
+            if fred.trim().is_empty() && llm.trim().is_empty() && brave.trim().is_empty() {
+                ui.label(
+                    egui::RichText::new("warning: this will result in limited functionality")
+                        .color(egui::Color32::from_rgb(244, 67, 54)),
+                );
+                ui.add_space(10.0);
+            }
+            if ui.button("Continue").clicked() {
+                done = true;
+            }
+        });
+        if done {
+            if let Some((fred, llm, brave)) = self.key_prompt.take() {
+                if let Ok(conn) = self.db.lock() {
+                    if !fred.trim().is_empty() {
+                        config_set(&conn, "fred_key", fred.trim());
+                    }
+                    if !llm.trim().is_empty() {
+                        config_set(&conn, "llm_key", llm.trim());
+                    }
+                    if !brave.trim().is_empty() {
+                        config_set(&conn, "brave_key", brave.trim());
+                    }
+                }
+                self.llm_key = llm.trim().to_string();
+                self.brave_key = brave.trim().to_string();
+                self.status_text = "API keys saved".into();
+            }
+        }
+    }
+
     fn show_status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3023,6 +3148,10 @@ impl eframe::App for MacroApp {
         self.drain_events();
 
         self.show_title_bar(ui);
+        if self.key_prompt.is_some() {
+            self.show_key_prompt(ui);
+            return;
+        }
         self.show_status_bar(ui);
         self.show_controls(ui);
 
@@ -3093,6 +3222,7 @@ impl eframe::App for MacroApp {
                     }
                 });
             ui.add_space(spacing);
+            let row_w = ui.available_width();
             ui.horizontal(|ui| {
                 if let Some(last) = specs.last() {
                     let s = series
@@ -3102,7 +3232,7 @@ impl eframe::App for MacroApp {
                     MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
                 }
                 ui.add_space(spacing);
-                let chat_w = 2.0 * card_w + spacing - 16.0;
+                let chat_w = (row_w - card_w - 2.0 * spacing - 16.0).max(160.0);
                 MacroApp::chat_panel(
                     ui,
                     chat,
@@ -3125,6 +3255,7 @@ impl eframe::App for MacroApp {
                 mut llm_key,
                 mut llm_model,
                 mut refresh_mins,
+                mut brave_key,
             } => {
                 let mut open = true;
                 let mut save = false;
@@ -3173,6 +3304,18 @@ impl eframe::App for MacroApp {
                                 .desired_width(320.0)
                                 .hint_text("openai/gpt-4o-mini"),
                         );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Brave Search Key:");
+                            if ui.small_button("copy").on_hover_text("copy key to clipboard").clicked() {
+                                ui.ctx().copy_text(brave_key.clone());
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut brave_key)
+                                .desired_width(320.0)
+                                .password(true),
+                        );
                         ui.add_space(8.0);
                         ui.separator();
                         ui.label("Refresh interval (minutes):");
@@ -3189,6 +3332,7 @@ impl eframe::App for MacroApp {
                         config_set(&conn, "llm_key", llm_key.trim());
                         config_set(&conn, "llm_model", llm_model.trim());
                         config_set(&conn, "refresh_mins", refresh_mins.trim());
+                        config_set(&conn, "brave_key", brave_key.trim());
                     }
                     self.llm_base_url = if llm_base_url.trim().is_empty() {
                         "https://openrouter.ai/api/v1".into()
@@ -3196,6 +3340,7 @@ impl eframe::App for MacroApp {
                         llm_base_url.trim().to_string()
                     };
                     self.llm_key = llm_key.trim().to_string();
+                    self.brave_key = brave_key.trim().to_string();
                     self.status_text = "Settings saved (restart to apply)".into();
                 } else if open {
                     self.dialog_state = DialogState::Settings {
@@ -3204,6 +3349,7 @@ impl eframe::App for MacroApp {
                         llm_key,
                         llm_model,
                         refresh_mins,
+                        brave_key,
                     };
                 }
             }
