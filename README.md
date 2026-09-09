@@ -19,9 +19,10 @@ A personal macro + micro economics command centre. Single-binary desktop app in 
 ### Macro dashboard
 - Live market cards: AUD/USD, S&P 500, Nasdaq, Dow Jones, gold, silver, BTC, XMR
 - RBA cash rate and AU CPI (year-over-year, computed in-app)
-- Range selector (1M / 6M / 1Y / 5Y / Max) with per-range change badges
+- Range selector (1D, 1W, 1M / 6M / 1Y / 5Y / Max) with per-range change badges
 - Country selector (10 countries; Australia active)
 - Auto + manual refresh through a background worker thread
+- Data is stored in the database to avoid constant refresh
 
 ### Budget screen
 - Monthly spreadsheet of colour-coded spending categories, split into **Recurring** and **One-off** sections (custom categories, custom colours, negative amounts allowed)
@@ -47,6 +48,7 @@ A personal macro + micro economics command centre. Single-binary desktop app in 
 | Frankfurter (ECB) | AUD/USD daily |
 | Kraken | BTC, XMR OHLC + live tickers |
 | LBMA | Gold, silver |
+| Yahoo | Intraday + Long term |
 
 FRED needs a free API key (enter in Settings). Everything else is keyless.
 
