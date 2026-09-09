@@ -128,6 +128,7 @@ struct Series {
     unit: String,
     source_name: String,
     obs: Vec<(NaiveDate, f64)>,
+    intraday: Vec<(f64, f64)>,
     error: Option<String>,
 }
 
@@ -195,6 +196,7 @@ impl Series {
 
 enum DataEvent {
     SeriesUpdated { symbol: String, obs: Vec<(NaiveDate, f64)> },
+    IntradayUpdated { symbol: String, points: Vec<(f64, f64)> },
     Point { symbol: String, obs: (NaiveDate, f64) },
     Error { symbol: String, message: String },
     Status(String),
@@ -347,6 +349,54 @@ struct ApiKeys {
     fred: String,
 }
 
+fn parse_kraken_ohlc_ts(body: &str) -> Vec<(f64, f64)> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        result: serde_json::Value,
+    }
+    let Ok(resp) = serde_json::from_str::<Resp>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = resp
+        .result
+        .as_object()
+        .and_then(|o| o.values().find(|v| v.is_array()))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for candle in arr {
+        let Some(parts) = candle.as_array() else { continue };
+        if parts.len() < 5 {
+            continue;
+        }
+        let Some(time) = parts[0].as_u64() else { continue };
+        let Some(close) = parts[4].as_str().and_then(|s| s.parse::<f64>().ok()) else {
+            continue;
+        };
+        out.push((719_163.0 + time as f64 / 86400.0, close));
+    }
+    out
+}
+
+fn fetch_kraken_intraday(pair: &str) -> Vec<(f64, f64)> {
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for interval in [5u64, 60] {
+        let url = format!(
+            "https://api.kraken.com/0/public/OHLC?pair={}&interval={}&since=0",
+            pair, interval
+        );
+        if let Ok(body) = http_get(&url) {
+            merged.extend(parse_kraken_ohlc_ts(&body));
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    merged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    merged.dedup_by(|a, b| a.0 == b.0);
+    merged
+}
+
 fn fred_yoy(obs: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f64)> {
     // Convert a quarterly index level series to year-over-year percentage.
     let mut out = Vec::new();
@@ -418,18 +468,106 @@ fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec
             Ok(obs)
         }
         Source::Kraken => {
-            let url = format!(
-                "https://api.kraken.com/0/public/OHLC?pair={}&interval=1440&since=0",
-                spec.symbol.to_uppercase()
-            );
-            let body = http_get(&url)?;
-            let obs = parse_kraken_ohlc(&body);
-            if obs.is_empty() {
+            let pair = spec.symbol.to_uppercase();
+            let mut all = fetch_kraken_ohlc_page(&pair, 0)?;
+            if all.is_empty() {
                 return Err("no data returned".into());
             }
-            Ok(obs)
+            let base = spec.symbol.trim_end_matches("usd").to_uppercase();
+            if let Ok(hist) = fetch_yahoo_daily(&format!("{}-USD", base)) {
+                let oldest = all[0].0;
+                for (d, v) in hist {
+                    if d < oldest {
+                        all.push((d, v));
+                    }
+                }
+                all.sort_by_key(|(d, _)| *d);
+            }
+            Ok(all)
         }
     }
+}
+
+fn yahoo_intraday_ticker(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "AUDUSD" => Some("AUDUSD=X"),
+        "SP500" => Some("^GSPC"),
+        "NASDAQCOM" => Some("^IXIC"),
+        "DJIA" => Some("^DJI"),
+        "GOLD" => Some("GC=F"),
+        "SILVER" => Some("SI=F"),
+        _ => None,
+    }
+}
+
+fn fetch_yahoo_intraday(ticker: &str) -> Result<Vec<(f64, f64)>, String> {
+    let url = format!(
+        "https://query2.finance.yahoo.com/v8/finance/chart/{}?range=7d&interval=60m",
+        ticker
+    );
+    let body = http_get_ua(&url, 30)?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let result = v["chart"]["result"]
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or_else(|| "no result".to_string())?;
+    let ts = result["timestamp"]
+        .as_array()
+        .ok_or_else(|| "no timestamps".to_string())?;
+    let closes = result["indicators"]["quote"][0]["close"]
+        .as_array()
+        .ok_or_else(|| "no closes".to_string())?;
+    let mut out = Vec::new();
+    for (t, c) in ts.iter().zip(closes) {
+        let (Some(t), Some(c)) = (t.as_f64(), c.as_f64()) else {
+            continue;
+        };
+        out.push((719_163.0 + t / 86400.0, c));
+    }
+    Ok(out)
+}
+
+fn fetch_yahoo_daily(ticker: &str) -> Result<Vec<(NaiveDate, f64)>, String> {
+    let url = format!(
+        "https://query2.finance.yahoo.com/v8/finance/chart/{}?range=max&interval=1d",
+        ticker
+    );
+    let body = http_get_ua(&url, 30)?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let result = v["chart"]["result"]
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or_else(|| "no result".to_string())?;
+    let ts = result["timestamp"]
+        .as_array()
+        .ok_or_else(|| "no timestamps".to_string())?;
+    let closes = result["indicators"]["quote"][0]["close"]
+        .as_array()
+        .ok_or_else(|| "no closes".to_string())?;
+    let mut out = Vec::new();
+    for (t, c) in ts.iter().zip(closes) {
+        let (Some(t), Some(c)) = (t.as_f64(), c.as_f64()) else {
+            continue;
+        };
+        let Some(date) =
+            chrono::DateTime::from_timestamp(t as i64, 0).map(|dt| dt.date_naive())
+        else {
+            continue;
+        };
+        out.push((date, c));
+    }
+    out.sort_by_key(|(d, _)| *d);
+    out.dedup_by(|a, b| a.0 == b.0);
+    Ok(out)
+}
+
+fn fetch_kraken_ohlc_page(pair: &str, since: u64) -> Result<Vec<(NaiveDate, f64)>, String> {
+    let url = format!(
+        "https://api.kraken.com/0/public/OHLC?pair={}&interval=1440&since={}",
+        pair, since
+    );
+    let body = http_get(&url)?;
+    Ok(parse_kraken_ohlc(&body))
 }
 
 fn fetch_kraken_live(symbol: &str) -> Result<f64, String> {
@@ -586,7 +724,6 @@ fn http_get_ua(url: &str, timeout_secs: u64) -> Result<String, String> {
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
         )
-        .header("Accept", "text/html,application/xhtml+xml")
         .call()
         .map_err(|e| e.to_string())?;
     let mut body = String::new();
@@ -1115,6 +1252,12 @@ CREATE TABLE IF NOT EXISTS observations (
     value REAL NOT NULL,
     PRIMARY KEY (symbol, date)
 );
+CREATE TABLE IF NOT EXISTS intraday (
+    symbol TEXT NOT NULL,
+    t REAL NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (symbol, t)
+);
 CREATE TABLE IF NOT EXISTS series_meta (
     symbol TEXT PRIMARY KEY,
     last_fetched TEXT NOT NULL DEFAULT ''
@@ -1195,8 +1338,41 @@ fn db_load_series(conn: &Connection, symbol: &str) -> Vec<(NaiveDate, f64)> {
     .unwrap_or_default()
 }
 
-fn db_save_series(conn: &Connection, symbol: &str, obs: &[(NaiveDate, f64)]) {
+fn db_load_intraday(conn: &Connection, symbol: &str) -> Vec<(f64, f64)> {
+    let mut stmt = match conn.prepare("SELECT t, value FROM intraday WHERE symbol = ?1 ORDER BY t")
+    {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(rusqlite::params![symbol], |row| {
+        let t: f64 = row.get(0)?;
+        let value: f64 = row.get(1)?;
+        Ok((t, value))
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+fn db_save_intraday(conn: &Connection, symbol: &str, points: &[(f64, f64)]) {
     conn.execute_batch("BEGIN IMMEDIATE").ok();
+    for (t, value) in points {
+        conn.execute(
+            "INSERT INTO intraday (symbol, t, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(symbol, t) DO UPDATE SET value = excluded.value",
+            rusqlite::params![symbol, t, value],
+        )
+        .ok();
+    }
+    let now_x = 719_163.0 + chrono::Utc::now().timestamp() as f64 / 86400.0;
+    conn.execute(
+        "DELETE FROM intraday WHERE t < ?1",
+        rusqlite::params![now_x - 8.0],
+    )
+    .ok();
+    conn.execute_batch("COMMIT").ok();
+}
+
+fn db_save_series(conn: &Connection, symbol: &str, obs: &[(NaiveDate, f64)]) {    conn.execute_batch("BEGIN IMMEDIATE").ok();
     for (date, value) in obs {
         conn.execute(
             "INSERT INTO observations (symbol, date, value) VALUES (?1, ?2, ?3)
@@ -1586,6 +1762,13 @@ fn spawn_worker(
     };
 
     let mut last_history: HashMap<String, std::time::Instant> = HashMap::new();
+    if let Ok(conn) = db_mutex.lock() {
+        for spec in &specs {
+            if !db_load_series(&conn, spec.symbol).is_empty() {
+                last_history.insert(spec.symbol.to_string(), std::time::Instant::now());
+            }
+        }
+    }
     let mut last_quotes = std::time::Instant::now()
         .checked_sub(Duration::from_secs(24 * 60 * 60))
         .unwrap_or_else(std::time::Instant::now);
@@ -1625,6 +1808,40 @@ fn spawn_worker(
                     }
                 }
                 last_quotes = std::time::Instant::now();
+                for spec in specs
+                    .iter()
+                    .filter(|s| matches!(s.source, Source::Kraken))
+                {
+                    let points = fetch_kraken_intraday(&spec.symbol.to_uppercase());
+                    if !points.is_empty() {
+                        if let Ok(conn) = db_mutex.lock() {
+                            db_save_intraday(&conn, &spec.symbol, &points);
+                        }
+                        let _ = tx.send(DataEvent::IntradayUpdated {
+                            symbol: spec.symbol.to_string(),
+                            points,
+                        });
+                        any_event = true;
+                    }
+                }
+                for spec in specs.iter() {
+                    let Some(ticker) = yahoo_intraday_ticker(spec.symbol) else {
+                        continue;
+                    };
+                    if let Ok(points) = fetch_yahoo_intraday(ticker) {
+                        if !points.is_empty() {
+                            if let Ok(conn) = db_mutex.lock() {
+                                db_save_intraday(&conn, &spec.symbol, &points);
+                            }
+                            let _ = tx.send(DataEvent::IntradayUpdated {
+                                symbol: spec.symbol.to_string(),
+                                points,
+                            });
+                            any_event = true;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(400));
+                }
             }
 
             // Full history refresh
@@ -1759,7 +1976,7 @@ fn color_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().rect_filled(rect, 2.0, color);
 }
 
-fn plot_line(ui: &mut egui::Ui, id: &str, obs: &[(NaiveDate, f64)], width: f32, height: f32) {
+fn plot_line(ui: &mut egui::Ui, id: &str, obs: &[(f64, f64)], width: f32, height: f32) {
     egui_plot::Plot::new(id)
         .width(width)
         .height(height)
@@ -1768,11 +1985,17 @@ fn plot_line(ui: &mut egui::Ui, id: &str, obs: &[(NaiveDate, f64)], width: f32, 
         .allow_zoom(false)
         .show_axes([false, true])
         .show_background(false)
+        .label_formatter(|pos| match pos {
+            egui_plot::HoverPosition::NearDataPoint { position, .. } => {
+                let date = NaiveDate::from_num_days_from_ce_opt(position.x as i32)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                Some(format!("{}\n${}", date, fmt_value(position.y)))
+            }
+            egui_plot::HoverPosition::Elsewhere { .. } => None,
+        })
         .show(ui, |plot_ui| {
-            let points: Vec<[f64; 2]> = obs
-                .iter()
-                .map(|(d, v)| [d.num_days_from_ce() as f64, *v])
-                .collect();
+            let points: Vec<[f64; 2]> = obs.iter().map(|(x, v)| [*x, *v]).collect();
             plot_ui.line(
                 egui_plot::Line::new(id, egui_plot::PlotPoints::from(points))
                     .color(egui::Color32::from_rgb(33, 150, 243))
@@ -1787,6 +2010,8 @@ fn plot_line(ui: &mut egui::Ui, id: &str, obs: &[(NaiveDate, f64)], width: f32, 
 
 #[derive(Clone, Copy, PartialEq)]
 enum Range {
+    D1,
+    W1,
     M1,
     M6,
     Y1,
@@ -1797,6 +2022,8 @@ enum Range {
 impl Range {
     fn label(&self) -> &'static str {
         match self {
+            Range::D1 => "1D",
+            Range::W1 => "1W",
             Range::M1 => "1M",
             Range::M6 => "6M",
             Range::Y1 => "1Y",
@@ -1807,6 +2034,8 @@ impl Range {
 
     fn days(&self) -> u32 {
         match self {
+            Range::D1 => 1,
+            Range::W1 => 7,
             Range::M1 => 30,
             Range::M6 => 183,
             Range::Y1 => 365,
@@ -1879,6 +2108,7 @@ impl MacroApp {
         let mut series = HashMap::new();
         for spec in &specs {
             let obs = db_load_series(&conn, spec.symbol);
+            let intraday = db_load_intraday(&conn, spec.symbol);
             series.insert(
                 spec.symbol.to_string(),
                 Series {
@@ -1886,6 +2116,7 @@ impl MacroApp {
                     unit: spec.unit.to_string(),
                     source_name: spec.source.name().to_string(),
                     obs,
+                    intraday,
                     error: None,
                 },
             );
@@ -1897,6 +2128,8 @@ impl MacroApp {
         let selected_country = Country::from_name(&config_get(&conn, "country"));
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
         let range = match config_get(&conn, "range").as_str() {
+            "1D" => Range::D1,
+            "1W" => Range::W1,
             "1M" => Range::M1,
             "6M" => Range::M6,
             "1Y" => Range::Y1,
@@ -1987,12 +2220,17 @@ impl MacroApp {
     fn drain_events(&mut self) {
         while let Ok(event) = self.data_rx.try_recv() {
             match event {
-                DataEvent::SeriesUpdated { symbol, obs } => {
+                 DataEvent::SeriesUpdated { symbol, obs } => {
                     if let Some(s) = self.series.get_mut(&symbol) {
                         s.obs = obs;
                         s.error = None;
                     }
                     self.last_updated = chrono::Local::now().format("%H:%M:%S").to_string();
+                }
+                DataEvent::IntradayUpdated { symbol, points } => {
+                    if let Some(s) = self.series.get_mut(&symbol) {
+                        s.intraday = points;
+                    }
                 }
                 DataEvent::Point { symbol, obs } => {
                     if let Some(s) = self.series.get_mut(&symbol) {
@@ -2173,8 +2411,34 @@ impl MacroApp {
                         .small()
                         .color(egui::Color32::GRAY),
                     );
-                    if s.obs.len() > 1 {
-                        plot_line(ui, &format!("spark_{}", s.title), s.slice_range(range.days()), plot_w, plot_h);
+                    let span = range.days();
+                    let use_intraday = matches!(range, Range::D1 | Range::W1) && !s.intraday.is_empty();
+                    if use_intraday {
+                        let now_x = 719_163.0
+                            + chrono::Utc::now().timestamp() as f64 / 86400.0;
+                        let pts: Vec<(f64, f64)> = s
+                            .intraday
+                            .iter()
+                            .filter(|(x, _)| *x >= now_x - span as f64)
+                            .cloned()
+                            .collect();
+                        if pts.len() > 1 {
+                            plot_line(ui, &format!("spark_{}", s.title), &pts, plot_w, plot_h);
+                        }
+                    } else if s.obs.len() > 1 {
+                        let sliced = s.slice_range(span);
+                        let start = if sliced.len() >= 2 {
+                            s.obs.len() - sliced.len()
+                        } else {
+                            s.obs.len().saturating_sub(2)
+                        };
+                        let pts: Vec<(f64, f64)> = s.obs[start..]
+                            .iter()
+                            .map(|(d, v)| (d.num_days_from_ce() as f64, *v))
+                            .collect();
+                        if pts.len() > 1 {
+                            plot_line(ui, &format!("spark_{}", s.title), &pts, plot_w, plot_h);
+                        }
                     } else if let Some(ref err) = s.error {
                         ui.label(
                             egui::RichText::new(err)
@@ -2473,6 +2737,7 @@ impl MacroApp {
                     });
                     ui.separator();
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             let enter_send = {
                                 let resp = ui.add(
@@ -3182,7 +3447,7 @@ impl MacroApp {
                 }
                 ui.separator();
                 ui.label("Range:");
-                for r in [Range::M1, Range::M6, Range::Y1, Range::Y5, Range::Max] {
+                for r in [Range::D1, Range::W1, Range::M1, Range::M6, Range::Y1, Range::Y5, Range::Max] {
                     if ui
                         .selectable_label(self.range == r, r.label())
                         .clicked()
@@ -3368,8 +3633,8 @@ impl eframe::App for MacroApp {
                         .unwrap_or_default();
                     MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
                 }
-                ui.add_space(spacing);
-                let chat_w = (row_w - card_w - 2.0 * spacing - 16.0).max(160.0);
+                ui.add_space((spacing - 8.0).max(0.0));
+                let chat_w = (row_w - card_w - 2.0 * spacing - 10.0).max(160.0);
                 MacroApp::chat_panel(
                     ui,
                     chat,
