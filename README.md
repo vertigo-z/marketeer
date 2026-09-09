@@ -19,7 +19,7 @@ A personal macro + micro economics command centre. Single-binary desktop app in 
 ### Macro dashboard
 - Live market cards: AUD/USD, S&P 500, Nasdaq, Dow Jones, gold, silver, BTC, XMR
 - RBA cash rate and AU CPI (year-over-year, computed in-app)
-- Range selector (1D, 1W, 1M / 6M / 1Y / 5Y / Max) with per-range change badges
+- Range selector (1D / 1W / 1M / 6M / 1Y / 5Y / Max) with per-range change badges
 - Country selector (10 countries; Australia active)
 - Auto + manual refresh through a background worker thread
 - Data is stored in the database to avoid constant refresh
