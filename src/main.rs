@@ -1967,12 +1967,51 @@ fn fmt_value(v: f64) -> String {
     }
 }
 
+fn comma_group(v: f64, decimals: usize) -> String {
+    let s = format!("{:.*}", decimals, v);
+    let (int_part, frac) = match s.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (s.as_str(), None),
+    };
+    let neg = int_part.starts_with('-');
+    let digits = int_part.trim_start_matches('-');
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&grouped);
+    if let Some(f) = frac {
+        out.push('.');
+        out.push_str(f);
+    }
+    out
+}
+
 fn fmt_usd(v: f64) -> String {
     if v >= 1.0 {
-        format!("${:.2}", v)
+        format!("${}", comma_group(v, 2))
     } else {
-        format!("${:.4}", v)
+        format!("${}", comma_group(v, 4))
     }
+}
+
+fn dv_commas(v: f64, _r: std::ops::RangeInclusive<usize>) -> String {
+    comma_group(v, 0)
+}
+
+fn dv_parse(s: &str) -> Option<f64> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
+        .collect();
+    cleaned.parse::<f64>().ok()
 }
 
 fn color_swatch_row(ui: &mut egui::Ui, current: &mut String) {
@@ -2922,6 +2961,8 @@ impl MacroApp {
                                 egui::DragValue::new(amount)
                                     .speed(1.0)
                                     .prefix("$")
+                                    .custom_formatter(dv_commas)
+                                    .custom_parser(dv_parse)
                                     .range(-1_000_000_000.0..=1_000_000_000.0),
                             );
                             if resp.changed() {
@@ -3029,6 +3070,8 @@ impl MacroApp {
                                         egui::DragValue::new(&mut budget.cumulative)
                                             .speed(10.0)
                                             .prefix("$")
+                                            .custom_formatter(dv_commas)
+                                            .custom_parser(dv_parse)
                                             .range(-1_000_000_000.0..=1_000_000_000.0),
                                     );
                                     if resp.changed() {
@@ -3411,6 +3454,8 @@ impl MacroApp {
                             egui::DragValue::new(&mut income)
                                 .speed(10.0)
                                 .prefix("$")
+                                .custom_formatter(dv_commas)
+                                .custom_parser(dv_parse)
                                 .range(0.0..=10_000_000.0),
                         )
                         .changed()
