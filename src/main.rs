@@ -181,6 +181,22 @@ impl Series {
         }
     }
 
+    fn year_stats(&self) -> Option<(f64, f64, f64, f64, f64)> {
+        let mut vals: Vec<f64> = self.obs.iter().rev().take(365).map(|o| o.1).collect();
+        if vals.len() < 30 {
+            return None;
+        }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pick = |i: usize| vals[i.min(vals.len() - 1)];
+        Some((
+            vals[0],
+            pick(vals.len() / 4),
+            pick(vals.len() / 2),
+            pick(vals.len() * 3 / 4),
+            vals[vals.len() - 1],
+        ))
+    }
+
     fn slice_range(&self, days: u32) -> &[(NaiveDate, f64)] {
         if days == 0 {
             return &self.obs;
@@ -1197,9 +1213,8 @@ fn market_system_prompt(
             country.name()
         ),
         format!(
-            "Today is {}. Live dashboard snapshot — value, {}-window change, as-of date:",
-            chrono::Local::now().format("%Y-%m-%d"),
-            range.label()
+            "Today is {}. Live dashboard snapshot — value, window changes, 52-week range stats, as-of date:",
+            chrono::Local::now().format("%Y-%m-%d")
         ),
     ];
     for spec in specs {
@@ -1222,8 +1237,20 @@ fn market_system_prompt(
         } else {
             format!(" {}", s.unit)
         };
+        let year_ctx = match s.year_stats() {
+            Some((lo, p25, med, p75, hi)) => format!(
+                " | 52w low {} / median {} / high {} | typically {} to {} | now {:+.1}% vs 52w high",
+                fmt_value(lo),
+                fmt_value(med),
+                fmt_value(hi),
+                fmt_value(p25),
+                fmt_value(p75),
+                (v / hi - 1.0) * 100.0
+            ),
+            None => String::new(),
+        };
         lines.push(format!(
-            "• {} — {}{} | 1D {} | 1M {} | 1Y {} | view({}) {} | as of {}",
+            "• {} — {}{} | 1D {} | 1M {} | 1Y {} | view({}) {}{} | as of {}",
             s.title,
             fmt_value(v),
             unit,
@@ -1232,6 +1259,7 @@ fn market_system_prompt(
             y1,
             range.label(),
             rng,
+            year_ctx,
             date
         ));
     }
@@ -2860,17 +2888,30 @@ impl MacroApp {
                                 *action = Some(BudgetAction::OpenEdit(cat.id));
                             }
                             resp.on_hover_text("edit category");
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(&cat.name).color(color),
-                                    )
-                                    .frame(false)
-                                    .small(),
+                            let name_resp = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(&cat.name).color(color),
                                 )
-                                .clicked()
-                            {
+                                .frame(false)
+                                .small(),
+                            );
+                            if name_resp.clicked() {
                                 *action = Some(BudgetAction::OpenEdit(cat.id));
+                            }
+                            if recurring {
+                                let month = budget.month_str();
+                                name_resp.context_menu(|ui| {
+                                    if ui.button("copy recurring from last month").clicked() {
+                                        let t = budget.year * 12 + budget.month as i32 - 2;
+                                        let last_month = format!("{:04}-{:02}", t / 12, t % 12 + 1);
+                                        if let Ok(conn) = db.lock() {
+                                            let v = db_budget_amount(&conn, cat.id, &last_month);
+                                            db_budget_set_amount(&conn, cat.id, &month, v);
+                                            budget.amounts.insert(cat.id, v);
+                                        }
+                                        ui.close();
+                                    }
+                                });
                             }
                             let month = budget.month_str();
                             let amount = budget
@@ -2918,7 +2959,7 @@ impl MacroApp {
         let avail_h = ui.available_height();
         let left_w = (avail_w * 0.37).max(280.0);
         let right_w = (avail_w - left_w - spacing - 4.0).max(240.0);
-        let pie_r = ((right_w - 20.0) / 2.0).min(((avail_h - 200.0) / 4.0).max(40.0));
+        let pie_r = (((right_w - 20.0) / 3.0) * 1.2).min((((avail_h - 200.0) / 4.0) * 1.2).max(48.0));
         let per_col = (((avail_h - 340.0).max(80.0)) / 24.0).floor().max(4.0) as usize;
         egui::ScrollArea::vertical()
             .id_salt("budget_window_scroll")
@@ -3054,18 +3095,12 @@ impl MacroApp {
                 } else {
                     Vec::new()
                 };
-                ui.horizontal(|ui| {
-                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     MacroApp::draw_pie(ui, "pie_savings", pie_r, &slices1, "");
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
-                    ui.vertical(|ui| {
-                        ui.set_min_width(2.0 * pie_r);
-                        ui.set_max_width(2.0 * pie_r);
-                        egui::Grid::new("legend_savings")
+                    ui.add_space(spacing);
+                    egui::Grid::new("legend_savings")
                         .num_columns(4)
-                        .spacing([8.0, 3.0])
+                        .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                             for (label, value, color) in &slices1 {
                                 color_dot(ui, *color);
@@ -3080,7 +3115,6 @@ impl MacroApp {
                                 ui.end_row();
                             }
                         });
-                    });
                 });
                 ui.add_space(spacing);
                 ui.separator();
@@ -3101,31 +3135,22 @@ impl MacroApp {
                     .collect();
                 slices2.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let cat_spend: f64 = slices2.iter().map(|s| s.1).sum();
-                ui.horizontal(|ui| {
-                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     MacroApp::draw_pie(ui, "pie_categories", pie_r, &slices2, "");
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(((right_w - 2.0 * pie_r) * 0.5).max(0.0));
-                    ui.vertical(|ui| {
-                        ui.set_min_width(2.0 * pie_r);
-                        ui.set_max_width(2.0 * pie_r);
-                        egui::Grid::new("legend_categories")
-                        .num_columns(8)
-                        .spacing([8.0, 3.0])
+                    ui.add_space(spacing);
+                    egui::Grid::new("legend_categories")
+                        .num_columns(4)
+                        .spacing([8.0, 4.0])
                         .show(ui, |ui| {
-                            for (idx, (label, value, color)) in slices2.iter().enumerate() {
-                                if idx > 0 && idx % 2 == 0 {
-                                    ui.end_row();
-                                }
+                            for (label, value, color) in slices2.iter() {
                                 color_dot(ui, *color);
                                 ui.label(egui::RichText::new(label).small());
                                 ui.label(egui::RichText::new(fmt_usd(*value)).small());
                                 let pct = if cat_spend > 0.0 { value / cat_spend * 100.0 } else { 0.0 };
                                 ui.label(egui::RichText::new(format!("{:.0}%", pct)).small());
+                                ui.end_row();
                             }
                         });
-                    });
                 });
                 if slices2.is_empty() {
                     ui.label(egui::RichText::new("no spending this month").small().color(egui::Color32::GRAY));
@@ -3162,6 +3187,8 @@ impl MacroApp {
         let start = -std::f32::consts::FRAC_PI_2;
         let mut a0 = start;
         let mut hovered: Option<(String, f64, egui::Color32)> = None;
+        let mut hovered_pts: Vec<egui::Pos2> = Vec::new();
+        let mut hovered_mid: f32 = 0.0;
         for (label, value, color) in slices {
             let frac = (*value / total) as f32;
             let a1 = a0 + frac * tau;
@@ -3172,12 +3199,12 @@ impl MacroApp {
                 pts.push(center + radius * egui::vec2(ang.cos(), ang.sin()));
             }
             painter.add(egui::Shape::convex_polygon(
-                pts,
+                pts.clone(),
                 *color,
                 egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 40, 40)),
             ));
-            if response.hovered() {
-                if let Some(p) = response.interact_pointer_pos() {
+            if hovered.is_none() {
+                if let Some(p) = response.hover_pos() {
                     let d = p - center;
                     if d.length() <= radius {
                         let mut rel = d.angle() - start;
@@ -3187,11 +3214,28 @@ impl MacroApp {
                         let slice_span = a1 - start;
                         if rel < slice_span {
                             hovered = Some((label.clone(), *value, *color));
+                            hovered_pts = pts;
+                            hovered_mid = (a0 + a1) * 0.5;
                         }
                     }
                 }
             }
             a0 = a1;
+        }
+        if let Some((label, value, _)) = &hovered {
+            painter.add(egui::Shape::convex_polygon(
+                hovered_pts,
+                egui::Color32::TRANSPARENT,
+                egui::Stroke::new(2.5, egui::Color32::WHITE),
+            ));
+            let pos = center + (radius * 0.6) * egui::vec2(hovered_mid.cos(), hovered_mid.sin());
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                format!("{}\n{:.1}%", label, value / total * 100.0),
+                egui::FontId::proportional(13.0),
+                egui::Color32::WHITE,
+            );
         }
         if !center_text.is_empty() {
             painter.text(
@@ -3201,15 +3245,6 @@ impl MacroApp {
                 egui::FontId::monospace(radius * 0.34),
                 egui::Color32::WHITE,
             );
-        }
-        if let Some((label, value, _)) = hovered {
-            let total_f = total;
-            response.on_hover_text(format!(
-                "{} — {} ({:.1}%)",
-                label,
-                fmt_usd(value),
-                value / total_f * 100.0
-            ));
         }
     }
 
@@ -3305,13 +3340,10 @@ impl MacroApp {
                                 );
                             }
                         }
-                        let color_label = if self.budget.auto_color {
-                            "auto color-sort: ON"
-                        } else {
-                            "auto color-sort: OFF"
-                        };
-                        if ui.button(color_label).clicked() {
-                            self.budget.auto_color = !self.budget.auto_color;
+                        if ui
+                            .checkbox(&mut self.budget.auto_color, "auto color-sort")
+                            .changed()
+                        {
                             if let Ok(conn) = self.db.lock() {
                                 config_set(
                                     &conn,
