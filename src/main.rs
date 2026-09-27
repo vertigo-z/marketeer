@@ -1307,7 +1307,8 @@ CREATE TABLE IF NOT EXISTS budget_categories (
     name TEXT NOT NULL,
     color TEXT NOT NULL DEFAULT '#FF9800',
     sort_order INTEGER NOT NULL DEFAULT 0,
-    recurring INTEGER NOT NULL DEFAULT 1
+    recurring INTEGER NOT NULL DEFAULT 1,
+    month TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS budget_months (
     category_id INTEGER NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
@@ -1514,6 +1515,11 @@ fn db_seed_budget(conn: &Connection) {
         "ALTER TABLE chat_messages ADD COLUMN usage TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE budget_categories ADD COLUMN month TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    db_migrate_oneoff_months(conn);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM budget_categories", [], |r| r.get(0))
         .unwrap_or(0);
@@ -1529,22 +1535,103 @@ fn db_seed_budget(conn: &Connection) {
     }
 }
 
-fn db_budget_categories(conn: &Connection) -> Vec<BudgetCategory> {
-    let Ok(mut stmt) = conn
-        .prepare("SELECT id, name, color, recurring FROM budget_categories ORDER BY sort_order, id")
-    else {
+fn db_migrate_oneoff_months(conn: &Connection) {
+    let legacy: Vec<(i64, String, String, i64)> = match conn.prepare(
+        "SELECT id, name, color, sort_order FROM budget_categories WHERE recurring = 0 AND month = ''",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    if legacy.is_empty() {
+        return;
+    }
+    let now = chrono::Local::now();
+    let current = format!("{:04}-{:02}", now.year(), now.month());
+    for (id, name, color, sort_order) in legacy {
+        let months: Vec<String> = match conn
+            .prepare("SELECT month FROM budget_months WHERE category_id = ?1 ORDER BY month")
+        {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![id], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let months = if months.is_empty() {
+            vec![current.clone()]
+        } else {
+            months
+        };
+        for month in months {
+            conn.execute(
+                "INSERT INTO budget_categories (name, color, sort_order, recurring, month)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                rusqlite::params![name, color, sort_order, month],
+            )
+            .ok();
+            let new_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE budget_months SET category_id = ?1 WHERE category_id = ?2 AND month = ?3",
+                rusqlite::params![new_id, id, month],
+            )
+            .ok();
+        }
+        conn.execute(
+            "DELETE FROM budget_months WHERE category_id = ?1",
+            rusqlite::params![id],
+        )
+        .ok();
+        conn.execute(
+            "DELETE FROM budget_categories WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .ok();
+    }
+}
+
+fn db_budget_categories(conn: &Connection, month: Option<&str>) -> Vec<BudgetCategory> {
+    let (sql, needs_month) = if month.is_some() {
+        (
+            "SELECT id, name, color, recurring FROM budget_categories
+             WHERE recurring = 1 OR month = ?1 ORDER BY sort_order, id",
+            true,
+        )
+    } else {
+        (
+            "SELECT id, name, color, recurring FROM budget_categories ORDER BY sort_order, id",
+            false,
+        )
+    };
+    let Ok(mut stmt) = conn.prepare(sql) else {
         return Vec::new();
     };
-    stmt.query_map([], |row| {
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<BudgetCategory> {
         Ok(BudgetCategory {
             id: row.get(0)?,
             name: row.get(1)?,
             color: row.get(2)?,
             recurring: row.get::<_, i64>(3)? != 0,
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    };
+    if needs_month {
+        stmt.query_map(rusqlite::params![month.unwrap_or("")], map_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        stmt.query_map([], map_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
 }
 
 fn db_budget_amount(conn: &Connection, category_id: i64, month: &str) -> f64 {
@@ -1601,13 +1688,13 @@ fn db_budget_set_cumulative(conn: &Connection, month: &str, value: f64) {
     .ok();
 }
 
-fn db_budget_add_category(conn: &Connection, name: &str, color: &str, recurring: bool) {
+fn db_budget_add_category(conn: &Connection, name: &str, color: &str, recurring: bool, month: &str) {
     let next: i64 = conn
         .query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM budget_categories", [], |r| r.get(0))
         .unwrap_or(0);
     conn.execute(
-        "INSERT INTO budget_categories (name, color, sort_order, recurring) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![name, color, next, recurring as i64],
+        "INSERT INTO budget_categories (name, color, sort_order, recurring, month) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![name, color, next, recurring as i64, if recurring { "" } else { month }],
     )
     .ok();
 }
@@ -1620,8 +1707,8 @@ const RAINBOW_POOL: &[&str] = &[
     "#D50000", "#304FFE", "#AA00FF", "#263238", "#FFD600",
 ];
 
-fn db_budget_rainbow(conn: &Connection) {
-    let cats = db_budget_categories(conn);
+fn db_budget_rainbow(conn: &Connection, month: &str) {
+    let cats = db_budget_categories(conn, Some(month));
     let n = cats.len();
     if n == 0 {
         return;
@@ -1745,9 +1832,9 @@ impl BudgetState {
 
     fn reload(&mut self, conn: &Connection) {
         if self.auto_color {
-            db_budget_rainbow(conn);
+            db_budget_rainbow(conn, &self.month_str());
         }
-        self.categories = db_budget_categories(conn);
+        self.categories = db_budget_categories(conn, Some(&self.month_str()));
         self.amounts.clear();
         for c in &self.categories {
             self.amounts.insert(c.id, db_budget_amount(conn, c.id, &self.month_str()));
@@ -2940,16 +3027,34 @@ impl MacroApp {
                             if recurring {
                                 let month = budget.month_str();
                                 name_resp.context_menu(|ui| {
-                                    if ui.button("copy recurring from last month").clicked() {
-                                        let t = budget.year * 12 + budget.month as i32 - 2;
-                                        let last_month = format!("{:04}-{:02}", t / 12, t % 12 + 1);
-                                        if let Ok(conn) = db.lock() {
-                                            let v = db_budget_amount(&conn, cat.id, &last_month);
-                                            db_budget_set_amount(&conn, cat.id, &month, v);
-                                            budget.amounts.insert(cat.id, v);
-                                        }
-                                        ui.close();
+                                if ui.button("copy recurring from last month").clicked() {
+                                    let t = budget.year * 12 + budget.month as i32 - 2;
+                                    let last_month = format!("{:04}-{:02}", t / 12, t % 12 + 1);
+                                    if let Ok(conn) = db.lock() {
+                                        let v = db_budget_amount(&conn, cat.id, &last_month);
+                                        db_budget_set_amount(&conn, cat.id, &month, v);
+                                        budget.amounts.insert(cat.id, v);
                                     }
+                                    ui.close();
+                                }
+                                if ui.button("copy all recurring from last month").clicked() {
+                                    let t = budget.year * 12 + budget.month as i32 - 2;
+                                    let last_month = format!("{:04}-{:02}", t / 12, t % 12 + 1);
+                                    let ids: Vec<i64> = budget
+                                        .categories
+                                        .iter()
+                                        .filter(|c| c.recurring)
+                                        .map(|c| c.id)
+                                        .collect();
+                                    if let Ok(conn) = db.lock() {
+                                        for id in ids {
+                                            let v = db_budget_amount(&conn, id, &last_month);
+                                            db_budget_set_amount(&conn, id, &month, v);
+                                            budget.amounts.insert(id, v);
+                                        }
+                                    }
+                                    ui.close();
+                                }
                                 });
                             }
                             let month = budget.month_str();
@@ -3244,8 +3349,11 @@ impl MacroApp {
             painter.add(egui::Shape::convex_polygon(
                 pts.clone(),
                 *color,
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 40, 40)),
+                egui::Stroke::NONE,
             ));
+            let outline = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 40, 40));
+            painter.add(egui::Shape::line(pts.clone(), outline));
+            painter.line_segment([pts[pts.len() - 1], center], outline);
             if hovered.is_none() {
                 if let Some(p) = response.hover_pos() {
                     let d = p - center;
@@ -3266,11 +3374,10 @@ impl MacroApp {
             a0 = a1;
         }
         if let Some((label, value, _)) = &hovered {
-            painter.add(egui::Shape::convex_polygon(
-                hovered_pts,
-                egui::Color32::TRANSPARENT,
-                egui::Stroke::new(2.5, egui::Color32::WHITE),
-            ));
+            let last = hovered_pts.last().copied().unwrap_or(center);
+            let highlight = egui::Stroke::new(2.5, egui::Color32::WHITE);
+            painter.add(egui::Shape::line(hovered_pts, highlight));
+            painter.line_segment([last, center], highlight);
             let pos = center + (radius * 0.6) * egui::vec2(hovered_mid.cos(), hovered_mid.sin());
             painter.text(
                 pos,
@@ -3396,7 +3503,7 @@ impl MacroApp {
                             }
                             if self.budget.auto_color {
                                 if let Ok(conn) = self.db.lock() {
-                                    db_budget_rainbow(&conn);
+                                    db_budget_rainbow(&conn, &self.budget.month_str());
                                 }
                                 self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
                             }
@@ -3883,7 +3990,7 @@ impl eframe::App for MacroApp {
                     });
                 if save && !name.trim().is_empty() {
                     if let Ok(conn) = self.db.lock() {
-                        db_budget_add_category(&conn, name.trim(), color.trim(), recurring);
+                        db_budget_add_category(&conn, name.trim(), color.trim(), recurring, &self.budget.month_str());
                     }
                     self.budget.reload(&self.db.lock().unwrap_or_else(|p| p.into_inner()));
                     self.status_text = format!("Added category: {}", name.trim());
