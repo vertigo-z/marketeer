@@ -65,3 +65,4 @@ Deliberately minimal: the entire application is one file, `src/main.rs`.
 - ureq for HTTP, no async runtime
 - rusqlite (bundled) for persistence
 - Background worker thread + channel; UI never blocks on network
+- Transition animations between different tabs
