@@ -2,8 +2,6 @@
 
 A personal macro + micro economics command centre. Single-binary desktop app in Rust (egui) that puts markets, budgets, and an AI research analyst in one frameless window — fully local, no accounts, no telemetry.
 
-**Pre-release: Currently only supports Australia**
-
 ---
 
 <p align="middle">
