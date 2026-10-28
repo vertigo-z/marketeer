@@ -64,10 +64,124 @@ impl Country {
             .unwrap_or(Country::Australia)
     }
 
-    // Per-country dashboards are not implemented yet; the dashboard is
-    // Australia-driven for now.
     fn fx_symbol(&self) -> &'static str {
-        "AUDUSD"
+        match self {
+            Country::Australia => "AUDUSD",
+            Country::Usa => "EURUSD",
+            Country::China => "CNYUSD",
+            Country::Japan => "JPYUSD",
+            Country::India => "INRUSD",
+            Country::Uk => "GBPUSD",
+            Country::Germany => "EURUSD",
+            Country::Canada => "CADUSD",
+            Country::Russia => "RUBUSD",
+            Country::SouthKorea => "KRWUSD",
+        }
+    }
+
+    fn fx_title(&self) -> &'static str {
+        match self {
+            Country::Australia => "AUD/USD",
+            Country::Usa => "EUR/USD",
+            Country::China => "CNY/USD",
+            Country::Japan => "JPY/USD",
+            Country::India => "INR/USD",
+            Country::Uk => "GBP/USD",
+            Country::Germany => "EUR/USD",
+            Country::Canada => "CAD/USD",
+            Country::Russia => "RUB/USD",
+            Country::SouthKorea => "KRW/USD",
+        }
+    }
+
+    fn index_symbol(&self) -> &'static str {
+        match self {
+            Country::Australia => "ASX200",
+            Country::Usa => "SP500",
+            Country::China => "SSECOMP",
+            Country::Japan => "NIKKEI225",
+            Country::India => "NIFTY50",
+            Country::Uk => "FTSE100",
+            Country::Germany => "DAX40",
+            Country::Canada => "TSXCOMP",
+            Country::Russia => "MOEX",
+            Country::SouthKorea => "KOSPI",
+        }
+    }
+
+    fn index_title(&self) -> &'static str {
+        match self {
+            Country::Australia => "ASX 200",
+            Country::Usa => "S&P 500",
+            Country::China => "SSE Composite",
+            Country::Japan => "Nikkei 225",
+            Country::India => "Nifty 50",
+            Country::Uk => "FTSE 100",
+            Country::Germany => "DAX 40",
+            Country::Canada => "TSX Composite",
+            Country::Russia => "MOEX Index",
+            Country::SouthKorea => "KOSPI",
+        }
+    }
+
+    fn rate_symbol(&self) -> &'static str {
+        match self {
+            Country::Australia => "IRSTCI01AUM156N",
+            Country::Usa => "IRSTCI01USM156N",
+            Country::China => "IRSTCI01CNM156N",
+            Country::Japan => "IRSTCI01JPM156N",
+            Country::India => "IRSTCI01INM156N",
+            Country::Uk => "IRSTCI01GBM156N",
+            Country::Germany => "IRSTCI01DEM156N",
+            Country::Canada => "IRSTCI01CAM156N",
+            Country::Russia => "IRSTCI01RUM156N",
+            Country::SouthKorea => "IRSTCI01KRM156N",
+        }
+    }
+
+    fn rate_title(&self) -> &'static str {
+        match self {
+            Country::Australia => "RBA Cash Rate",
+            Country::Usa => "Fed Funds Rate",
+            Country::China => "PBoC Policy Rate",
+            Country::Japan => "BoJ Policy Rate",
+            Country::India => "RBI Repo Rate",
+            Country::Uk => "BoE Bank Rate",
+            Country::Germany => "ECB Refi Rate",
+            Country::Canada => "BoC Overnight Rate",
+            Country::Russia => "CBR Key Rate",
+            Country::SouthKorea => "BoK Base Rate",
+        }
+    }
+
+    fn cpi_symbol(&self) -> &'static str {
+        match self {
+            Country::Australia => "CPALTT01AUSM659N",
+            Country::Usa => "CPALTT01USM659N",
+            Country::China => "CPALTT01CHNM659N",
+            Country::Japan => "CPALTT01JPNM659N",
+            Country::India => "CPALTT01INDM659N",
+            Country::Uk => "CPALTT01GBRM659N",
+            Country::Germany => "CPALTT01DEUM659N",
+            Country::Canada => "CPALTT01CANM659N",
+            Country::Russia => "CPALTT01RUSM659N",
+            Country::SouthKorea => "CPALTT01KORM659N",
+        }
+    }
+
+    fn cpi_title(&self) -> &'static str {
+        match self {
+            Country::Australia => "AU CPI (YoY)",
+            Country::Usa => "US CPI (YoY)",
+            Country::China => "CN CPI (YoY)",
+            Country::Japan => "JP CPI (YoY)",
+            Country::India => "IN CPI (YoY)",
+            Country::Uk => "UK CPI (YoY)",
+            Country::Germany => "DE CPI (YoY)",
+            Country::Canada => "CA CPI (YoY)",
+            Country::Russia => "RU CPI (YoY)",
+            Country::SouthKorea => "KR CPI (YoY)",
+        }
     }
 }
 
@@ -105,8 +219,13 @@ struct SeriesSpec {
 }
 
 fn registry(country: Country) -> Vec<SeriesSpec> {
+    let cpi = if country == Country::Australia {
+        SeriesSpec { symbol: "AUSCPIALLQINMEI", title: "AU CPI (YoY)", unit: "%", source: Source::Fred, market: false, yoy: true }
+    } else {
+        SeriesSpec { symbol: country.cpi_symbol(), title: country.cpi_title(), unit: "%", source: Source::Fred, market: false, yoy: false }
+    };
     vec![
-        SeriesSpec { symbol: country.fx_symbol(), title: "AUD/USD", unit: "", source: Source::Frankfurter, market: true, yoy: false },
+        SeriesSpec { symbol: country.fx_symbol(), title: country.fx_title(), unit: "", source: Source::Frankfurter, market: true, yoy: false },
         SeriesSpec { symbol: "SP500", title: "S&P 500", unit: "", source: Source::Fred, market: true, yoy: false },
         SeriesSpec { symbol: "NASDAQCOM", title: "NASDAQ Composite", unit: "", source: Source::Fred, market: true, yoy: false },
         SeriesSpec { symbol: "DJIA", title: "Dow Jones (DJIA)", unit: "", source: Source::Fred, market: true, yoy: false },
@@ -114,8 +233,8 @@ fn registry(country: Country) -> Vec<SeriesSpec> {
         SeriesSpec { symbol: "SILVER", title: "Silver (LBMA)", unit: "USD/oz", source: Source::Lbma, market: false, yoy: false },
         SeriesSpec { symbol: "btcusd", title: "Bitcoin (BTC/USD)", unit: "USD", source: Source::Kraken, market: true, yoy: false },
         SeriesSpec { symbol: "xmrusd", title: "Monero (XMR/USD)", unit: "USD", source: Source::Kraken, market: true, yoy: false },
-        SeriesSpec { symbol: "IRSTCI01AUM156N", title: "RBA Cash Rate", unit: "%", source: Source::Fred, market: false, yoy: false },
-        SeriesSpec { symbol: "AUSCPIALLQINMEI", title: "AU CPI (YoY)", unit: "%", source: Source::Fred, market: false, yoy: true },
+        SeriesSpec { symbol: country.rate_symbol(), title: country.rate_title(), unit: "%", source: Source::Fred, market: false, yoy: false },
+        cpi,
     ]
 }
 
@@ -436,9 +555,10 @@ fn fred_yoy(obs: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f64)> {
 fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec<(NaiveDate, f64)>, String> {
     match spec.source {
         Source::Frankfurter => {
+            let base = &spec.symbol[..3];
             let url = format!(
-                "https://api.frankfurter.app/{}-01-01..?from=AUD&to=USD",
-                from_year
+                "https://api.frankfurter.app/{}-01-01..?from={}&to=USD",
+                from_year, base
             );
             let body = http_get(&url)?;
             let obs = parse_frankfurter(&body, "USD");
@@ -508,8 +628,17 @@ fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec
 fn yahoo_intraday_ticker(symbol: &str) -> Option<&'static str> {
     match symbol {
         "AUDUSD" => Some("AUDUSD=X"),
+        "EURUSD" => Some("EURUSD=X"),
+        "CNYUSD" => Some("CNYUSD=X"),
+        "JPYUSD" => Some("JPYUSD=X"),
+        "INRUSD" => Some("INRUSD=X"),
+        "GBPUSD" => Some("GBPUSD=X"),
+        "CADUSD" => Some("CADUSD=X"),
+        "RUBUSD" => Some("RUBUSD=X"),
+        "KRWUSD" => Some("KRWUSD=X"),
         "SP500" => Some("^GSPC"),
         "NASDAQCOM" => Some("^IXIC"),
+        "NIKKEI225" => Some("^N225"),
         "DJIA" => Some("^DJI"),
         "GOLD" => Some("GC=F"),
         "SILVER" => Some("SI=F"),
@@ -1854,12 +1983,17 @@ impl BudgetState {
 // ---------------------------------------------------------------------------
 
 struct WorkerHandle {
+    stop: Arc<AtomicBool>,
     manual_trigger: Arc<AtomicBool>,
 }
 
 impl WorkerHandle {
     fn trigger(&self) {
         self.manual_trigger.store(true, Ordering::Relaxed);
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1874,6 +2008,7 @@ fn spawn_worker(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let manual_trigger = Arc::new(AtomicBool::new(false));
     let handle = WorkerHandle {
+        stop: stop_flag.clone(),
         manual_trigger: manual_trigger.clone(),
     };
 
@@ -2241,18 +2376,18 @@ enum Pane {
 fn pane_noop(_ui: &mut egui::Ui, _normal: f32) {}
 
 const PANE_ANIM: Animation<Sequence> = Animation::from_segments(
-    AnimationSegment::new(0.13, pane_noop),
-    AnimationSegment::new(0.22, pane_noop),
+    AnimationSegment::new(0.0975, pane_noop),
+    AnimationSegment::new(0.165, pane_noop),
 );
 
 const PANE_SHRINK: Animation<Sequence> = Animation::from_segments(
-    AnimationSegment::new(0.22, pane_noop),
-    AnimationSegment::new(0.13, pane_noop),
+    AnimationSegment::new(0.165, pane_noop),
+    AnimationSegment::new(0.0975, pane_noop),
 );
 
 const CONTROLS_ANIM: Animation<Sequence> = Animation::from_segments(
     AnimationSegment::new(0.0, pane_noop),
-    AnimationSegment::new(0.22, fade),
+    AnimationSegment::new(0.165, fade),
 );
 
 fn pane_anim(from: Pane, to: Pane) -> Animation<Sequence> {
@@ -2331,8 +2466,8 @@ impl MacroApp {
         let conn = Connection::open(db_path()).map_err(|e| e.to_string())?;
         conn.execute_batch(DB_SCHEMA).map_err(|e| e.to_string())?;
 
-        let country = Country::Australia;
-        let specs = registry(country);
+        let selected_country = Country::from_name(&config_get(&conn, "country"));
+        let specs = registry(selected_country);
         let mut series = HashMap::new();
         for spec in &specs {
             let obs = db_load_series(&conn, spec.symbol);
@@ -2353,7 +2488,6 @@ impl MacroApp {
         let keys = ApiKeys {
             fred: config_get(&conn, "fred_key"),
         };
-        let selected_country = Country::from_name(&config_get(&conn, "country"));
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
         let range = match config_get(&conn, "range").as_str() {
             "1D" => Range::D1,
@@ -2422,7 +2556,7 @@ impl MacroApp {
         );
 
         Ok(Self {
-            country,
+            country: selected_country,
             selected_country,
             series,
             specs,
@@ -2601,6 +2735,44 @@ impl MacroApp {
         }
     }
 
+    fn switch_country(&mut self, country: Country, ctx: egui::Context) {
+        self.country = country;
+        self.selected_country = country;
+        self.specs = registry(country);
+        let conn = self.db.lock().unwrap_or_else(|p| p.into_inner());
+        config_set(&conn, "country", country.name());
+        let mut series = HashMap::new();
+        for spec in &self.specs {
+            series.insert(
+                spec.symbol.to_string(),
+                Series {
+                    title: spec.title.to_string(),
+                    unit: spec.unit.to_string(),
+                    source_name: spec.source.name().to_string(),
+                    obs: db_load_series(&conn, spec.symbol),
+                    intraday: db_load_intraday(&conn, spec.symbol),
+                    error: None,
+                },
+            );
+        }
+        self.series = series;
+        let keys = ApiKeys {
+            fred: config_get(&conn, "fred_key"),
+        };
+        let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
+        drop(conn);
+        self.worker.stop();
+        self.worker = spawn_worker(
+            ctx,
+            self.specs.clone(),
+            keys,
+            refresh_mins * 60,
+            self.db.clone(),
+            self.chat_tx.clone(),
+        );
+        self.status_text = format!("{} dashboard", country.name());
+    }
+
     fn stat_card(ui: &mut egui::Ui, s: &Series, range: Range, plot_w: f32, plot_h: f32) {
         egui::Frame::group(ui.style())
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
@@ -2642,18 +2814,16 @@ impl MacroApp {
                     );
                     let span = range.days();
                     let use_intraday = matches!(range, Range::D1 | Range::W1) && !s.intraday.is_empty();
-                    if use_intraday {
+                    let pts: Option<Vec<(f64, f64)>> = if use_intraday {
                         let now_x = 719_163.0
                             + chrono::Utc::now().timestamp() as f64 / 86400.0;
-                        let pts: Vec<(f64, f64)> = s
+                        let p: Vec<(f64, f64)> = s
                             .intraday
                             .iter()
                             .filter(|(x, _)| *x >= now_x - span as f64)
                             .cloned()
                             .collect();
-                        if pts.len() > 1 {
-                            plot_line(ui, &format!("spark_{}", s.title), &pts, plot_w, plot_h);
-                        }
+                        (p.len() > 1).then_some(p)
                     } else if s.obs.len() > 1 {
                         let sliced = s.slice_range(span);
                         let start = if sliced.len() >= 2 {
@@ -2661,21 +2831,39 @@ impl MacroApp {
                         } else {
                             s.obs.len().saturating_sub(2)
                         };
-                        let pts: Vec<(f64, f64)> = s.obs[start..]
+                        let p: Vec<(f64, f64)> = s.obs[start..]
                             .iter()
                             .map(|(d, v)| (d.num_days_from_ce() as f64, *v))
                             .collect();
-                        if pts.len() > 1 {
-                            plot_line(ui, &format!("spark_{}", s.title), &pts, plot_w, plot_h);
-                        }
-                    } else if let Some(ref err) = s.error {
-                        ui.label(
-                            egui::RichText::new(err)
-                                .small()
-                                .color(egui::Color32::from_rgb(244, 67, 54)),
-                        );
+                        (p.len() > 1).then_some(p)
                     } else {
-                        ui.label(egui::RichText::new("loading…").small().color(egui::Color32::GRAY));
+                        None
+                    };
+                    match pts {
+                        Some(p) => {
+                            plot_line(ui, &format!("spark_{}", s.title), &p, plot_w, plot_h);
+                        }
+                        None => {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(plot_w, plot_h),
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                |ui| {
+                                    if s.error.is_some() {
+                                        ui.label(
+                                            egui::RichText::new("Not Available")
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(244, 67, 54)),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("loading…")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                },
+                            );
+                        }
                     }
                 });
             });
@@ -3676,7 +3864,7 @@ impl MacroApp {
                 ui.set_opacity(1.0);
                 ui.horizontal(|ui| {
                     ui.heading("Dashboard");
-                    let combo = egui::ComboBox::new("country_select", "")
+                    let _combo = egui::ComboBox::new("country_select", "")
                         .selected_text(self.selected_country.name())
                         .width(140.0)
                         .show_ui(ui, |ui| {
@@ -3691,18 +3879,9 @@ impl MacroApp {
                             ui.selectable_value(&mut self.selected_country, Country::Russia, "Russia");
                             ui.selectable_value(&mut self.selected_country, Country::SouthKorea, "South Korea");
                         });
-                    if combo.response.changed() {
-                        if let Ok(conn) = self.db.lock() {
-                            config_set(&conn, "country", self.selected_country.name());
-                        }
-                        if self.selected_country != self.country {
-                            self.status_text = format!(
-                                "{} dashboard coming soon — showing Australia",
-                                self.selected_country.name()
-                            );
-                        } else {
-                            self.status_text = "Ready".into();
-                        }
+                    if self.selected_country != self.country {
+                        let ctx = ui.ctx().clone();
+                        self.switch_country(self.selected_country, ctx);
                     }
                     ui.add_space(10.0);
                     if ui.button("Refresh").clicked() {
