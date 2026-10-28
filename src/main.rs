@@ -1,5 +1,6 @@
 use chrono::{Datelike, NaiveDate};
 use eframe::egui;
+use egui_animate::prelude::{Animation, AnimationSegment, Sequence, SequenceRunState, animate, fade, run_state};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2229,6 +2230,78 @@ enum DialogState {
     },
 }
 
+#[derive(Default, Clone, Copy, PartialEq)]
+enum Pane {
+    #[default]
+    Dashboard,
+    Budget,
+    ChatMax,
+}
+
+fn pane_noop(_ui: &mut egui::Ui, _normal: f32) {}
+
+const PANE_ANIM: Animation<Sequence> = Animation::from_segments(
+    AnimationSegment::new(0.13, pane_noop),
+    AnimationSegment::new(0.22, pane_noop),
+);
+
+const PANE_SHRINK: Animation<Sequence> = Animation::from_segments(
+    AnimationSegment::new(0.22, pane_noop),
+    AnimationSegment::new(0.13, pane_noop),
+);
+
+const CONTROLS_ANIM: Animation<Sequence> = Animation::from_segments(
+    AnimationSegment::new(0.0, pane_noop),
+    AnimationSegment::new(0.22, fade),
+);
+
+fn pane_anim(from: Pane, to: Pane) -> Animation<Sequence> {
+    match (from, to) {
+        (Pane::ChatMax, Pane::Dashboard) => PANE_SHRINK,
+        _ => PANE_ANIM,
+    }
+}
+
+fn pane_running(ui: &mut egui::Ui, from: Pane, to: Pane) -> bool {
+    run_state(ui, "pane_anim", pane_anim(from, to)).is_running()
+}
+
+fn pane_seg_normal(seg: &SequenceRunState) -> Option<(bool, f32)> {
+    match seg {
+        SequenceRunState::OutSeg(n) => Some((false, *n)),
+        SequenceRunState::InSeg(n) => Some((true, *n)),
+        SequenceRunState::None => None,
+    }
+}
+
+fn pane_chat_slot(rect: egui::Rect, n_specs: usize, n_grid: usize) -> egui::Rect {
+    let spacing = 12.0;
+    let cols = 3usize;
+    let rows_all = n_specs.div_ceil(cols).max(1);
+    let rows_grid = n_grid.div_ceil(cols).max(1);
+    let avail_w = rect.width();
+    let avail_h = rect.height();
+    let card_w = (((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32) - 2.0).max(180.0);
+    let card_h = ((avail_h - spacing * rows_all as f32) / rows_all as f32).max(140.0);
+    let grid_h = rows_grid as f32 * card_h + (rows_grid as f32 - 1.0) * spacing;
+    let chat_w = (avail_w - card_w - 2.0 * spacing - 10.0).max(160.0);
+    let min = rect.min + egui::vec2(card_w + spacing, grid_h + spacing);
+    egui::Rect::from_min_size(min, egui::vec2(chat_w, card_h))
+}
+
+fn pane_interp_rect(slot: egui::Rect, full: egui::Rect, normal: f32) -> egui::Rect {
+    let t = egui::emath::easing::cubic_out(normal).clamp(0.0, 1.0);
+    let min = egui::pos2(
+        slot.min.x + (full.min.x - slot.min.x) * t,
+        slot.min.y + (full.min.y - slot.min.y) * t,
+    );
+    let max = egui::pos2(
+        slot.max.x + (full.max.x - slot.max.x) * t,
+        slot.max.y + (full.max.y - slot.max.y) * t,
+    );
+    egui::Rect::from_min_max(min, max)
+}
+
 struct MacroApp {
     country: Country,
     selected_country: Country,
@@ -2240,6 +2313,7 @@ struct MacroApp {
     worker: WorkerHandle,
     chat: ChatState,
     chat_maximized: bool,
+    pane_from: Pane,
     budget: BudgetState,
     current_tab: String,
     llm_base_url: String,
@@ -2358,6 +2432,7 @@ impl MacroApp {
             worker,
             chat,
             chat_maximized: false,
+            pane_from: if current_tab == "Budget" { Pane::Budget } else { Pane::Dashboard },
             budget,
             current_tab,
             llm_base_url,
@@ -2798,6 +2873,7 @@ impl MacroApp {
         maximized: bool,
         width: f32,
         height: f32,
+        anim_active: bool,
         send: &mut bool,
         clear: &mut bool,
         toggle_max: &mut bool,
@@ -2860,6 +2936,7 @@ impl MacroApp {
                                 .small_button(max_label)
                                 .on_hover_text(max_tip)
                                 .clicked()
+                                && !anim_active
                             {
                                 *toggle_max = true;
                             }
@@ -3535,110 +3612,114 @@ impl MacroApp {
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("controls").show(ui, |ui| {
-            if self.current_tab == "Budget" {
-                ui.horizontal(|ui| {
-                    ui.heading("Budget");
-                    if ui.button("<").clicked() {
-                        self.budget.shift(-1);
-                        if let Ok(conn) = self.db.lock() {
-                            self.budget.reload(&conn);
+            let is_budget = self.current_tab == "Budget";
+            animate(ui, "controls_anim", is_budget, CONTROLS_ANIM, |ui, is_budget| {
+                if is_budget {
+                    ui.horizontal(|ui| {
+                        ui.heading("Budget");
+                        if ui.button("<").clicked() {
+                            self.budget.shift(-1);
+                            if let Ok(conn) = self.db.lock() {
+                                self.budget.reload(&conn);
+                            }
                         }
-                    }
-                    ui.label(
-                        egui::RichText::new(self.budget.month_label()).strong(),
-                    );
-                    if ui.button(">").clicked() {
-                        self.budget.shift(1);
-                        if let Ok(conn) = self.db.lock() {
-                            self.budget.reload(&conn);
-                        }
-                    }
-                    ui.add_space(14.0);
-                    ui.label("Income:");
-                    let mut income = self.budget.income;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut income)
-                                .speed(10.0)
-                                .prefix("$")
-                                .custom_formatter(dv_commas)
-                                .custom_parser(dv_parse)
-                                .range(0.0..=10_000_000.0),
-                        )
-                        .changed()
-                    {
-                        if let Ok(conn) = self.db.lock() {
-                            db_budget_set_income(&conn, &self.budget.month_str(), income);
-                        }
-                        self.budget.income = income;
-                    }
-                    ui.add_space(14.0);
-                    if ui.button("+ Category").clicked() {
-                        self.dialog_state = DialogState::AddCategory {
-                            name: String::new(),
-                            color: "#2196F3".into(),
-                            recurring: true,
-                        };
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "spend {}  ·  saved {}",
-                                fmt_usd(self.budget.total_spend()),
-                                fmt_usd(self.budget.income - self.budget.total_spend())
-                            ))
-                            .small()
-                            .color(egui::Color32::GRAY),
+                            egui::RichText::new(self.budget.month_label()).strong(),
                         );
+                        if ui.button(">").clicked() {
+                            self.budget.shift(1);
+                            if let Ok(conn) = self.db.lock() {
+                                self.budget.reload(&conn);
+                            }
+                        }
+                        ui.add_space(14.0);
+                        ui.label("Income:");
+                        let mut income = self.budget.income;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut income)
+                                    .speed(10.0)
+                                    .prefix("$")
+                                    .custom_formatter(dv_commas)
+                                    .custom_parser(dv_parse)
+                                    .range(0.0..=10_000_000.0),
+                            )
+                            .changed()
+                        {
+                            if let Ok(conn) = self.db.lock() {
+                                db_budget_set_income(&conn, &self.budget.month_str(), income);
+                            }
+                            self.budget.income = income;
+                        }
+                        ui.add_space(14.0);
+                        if ui.button("+ Category").clicked() {
+                            self.dialog_state = DialogState::AddCategory {
+                                name: String::new(),
+                                color: "#2196F3".into(),
+                                recurring: true,
+                            };
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "spend {}  ·  saved {}",
+                                    fmt_usd(self.budget.total_spend()),
+                                    fmt_usd(self.budget.income - self.budget.total_spend())
+                                ))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                            );
+                        });
                     });
+                    return;
+                }
+                ui.set_opacity(1.0);
+                ui.horizontal(|ui| {
+                    ui.heading("Dashboard");
+                    let combo = egui::ComboBox::new("country_select", "")
+                        .selected_text(self.selected_country.name())
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.selected_country, Country::Australia, "Australia");
+                            ui.selectable_value(&mut self.selected_country, Country::Usa, "USA");
+                            ui.selectable_value(&mut self.selected_country, Country::China, "China");
+                            ui.selectable_value(&mut self.selected_country, Country::Japan, "Japan");
+                            ui.selectable_value(&mut self.selected_country, Country::India, "India");
+                            ui.selectable_value(&mut self.selected_country, Country::Uk, "United Kingdom");
+                            ui.selectable_value(&mut self.selected_country, Country::Germany, "Germany");
+                            ui.selectable_value(&mut self.selected_country, Country::Canada, "Canada");
+                            ui.selectable_value(&mut self.selected_country, Country::Russia, "Russia");
+                            ui.selectable_value(&mut self.selected_country, Country::SouthKorea, "South Korea");
+                        });
+                    if combo.response.changed() {
+                        if let Ok(conn) = self.db.lock() {
+                            config_set(&conn, "country", self.selected_country.name());
+                        }
+                        if self.selected_country != self.country {
+                            self.status_text = format!(
+                                "{} dashboard coming soon — showing Australia",
+                                self.selected_country.name()
+                            );
+                        } else {
+                            self.status_text = "Ready".into();
+                        }
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Refresh").clicked() {
+                        self.worker.trigger();
+                        self.status_text = "Refreshing…".into();
+                    }
+                    ui.separator();
+                    ui.label("Range:");
+                    for r in [Range::D1, Range::W1, Range::M1, Range::M6, Range::Y1, Range::Y5, Range::Max] {
+                        if ui
+                            .selectable_label(self.range == r, r.label())
+                            .clicked()
+                        {
+                            self.set_range(r);
+                        }
+                    }
                 });
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.heading("Dashboard");
-                let combo = egui::ComboBox::new("country_select", "")
-                    .selected_text(self.selected_country.name())
-                    .width(140.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected_country, Country::Australia, "Australia");
-                        ui.selectable_value(&mut self.selected_country, Country::Usa, "USA");
-                        ui.selectable_value(&mut self.selected_country, Country::China, "China");
-                        ui.selectable_value(&mut self.selected_country, Country::Japan, "Japan");
-                        ui.selectable_value(&mut self.selected_country, Country::India, "India");
-                        ui.selectable_value(&mut self.selected_country, Country::Uk, "United Kingdom");
-                        ui.selectable_value(&mut self.selected_country, Country::Germany, "Germany");
-                        ui.selectable_value(&mut self.selected_country, Country::Canada, "Canada");
-                        ui.selectable_value(&mut self.selected_country, Country::Russia, "Russia");
-                        ui.selectable_value(&mut self.selected_country, Country::SouthKorea, "South Korea");
-                    });
-                if combo.response.changed() {
-                    if let Ok(conn) = self.db.lock() {
-                        config_set(&conn, "country", self.selected_country.name());
-                    }
-                    if self.selected_country != self.country {
-                        self.status_text = format!(
-                            "{} dashboard coming soon — showing Australia",
-                            self.selected_country.name()
-                        );
-                    } else {
-                        self.status_text = "Ready".into();
-                    }
-                }
-                ui.add_space(10.0);
-                if ui.button("Refresh").clicked() {
-                    self.worker.trigger();
-                    self.status_text = "Refreshing…".into();
-                }
-                ui.separator();
-                ui.label("Range:");
-                for r in [Range::D1, Range::W1, Range::M1, Range::M6, Range::Y1, Range::Y5, Range::Max] {
-                    if ui
-                        .selectable_label(self.range == r, r.label())
-                        .clicked()
-                    {
-                        self.set_range(r);
-                    }
-                }
             });
         });
     }
@@ -3751,86 +3832,151 @@ impl eframe::App for MacroApp {
         let mut custom_model = false;
         let mut budget_action: Option<BudgetAction> = None;
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
-            let tab = self.current_tab.clone();
+            let pane_from = self.pane_from;
+            let pane_to = if self.current_tab == "Budget" {
+                Pane::Budget
+            } else if self.chat_maximized {
+                Pane::ChatMax
+            } else {
+                Pane::Dashboard
+            };
+            let anim = pane_anim(pane_from, pane_to);
             let specs = self.specs.clone();
             let series = &self.series;
             let chat = &mut self.chat;
             let budget = &mut self.budget;
             let db = self.db.clone();
             let range = self.range;
-            let chat_maximized = self.chat_maximized;
-            let spacing = 12.0;
-            if tab == "Budget" {
-                let mut action: Option<BudgetAction> = None;
-                MacroApp::budget_screen(ui, budget, &db, &mut action);
-                budget_action = action;
-                return;
-            }
-            if chat_maximized {
-                let chat_w = ui.available_width() - 22.0;
-                let chat_h = ui.available_height() - 2.0;
-                MacroApp::chat_panel(
-                    ui,
-                    chat,
-                    true,
-                    chat_w,
-                    chat_h,
-                    &mut chat_send,
-                    &mut chat_clear,
-                    &mut chat_toggle,
-                    &mut custom_model,
-                );
-                return;
-            }
-            let cols = 3usize;
-            let total_rows = specs.len().div_ceil(cols);
-            let avail_w = ui.available_width();
-            let avail_h = ui.available_height();
-            let card_w = (((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32) - 2.0).max(180.0);
-            let card_h = ((avail_h - spacing * total_rows as f32) / total_rows as f32).max(140.0);
-            let plot_w = card_w - 16.0;
-            let plot_h = (card_h - 84.0).max(30.0);
-            let grid_specs = &specs[..specs.len().saturating_sub(1).min(9)];
-            egui::Grid::new("dashboard_grid")
-                .num_columns(cols)
-                .spacing([spacing, spacing])
-                .min_col_width(card_w)
-                .show(ui, |ui| {
-                    for (i, spec) in grid_specs.iter().enumerate() {
-                        let s = series
-                            .get(spec.symbol)
-                            .cloned()
-                            .unwrap_or_default();
-                        MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
-                        if i % cols == cols - 1 {
-                            ui.end_row();
-                        }
+            let full = ui.available_rect_before_wrap();
+            let anim_active = pane_running(ui, pane_from, pane_to);
+            animate(ui, "pane_anim", pane_to, anim, |ui, shown| {
+                let seg = run_state(ui, "pane_anim", anim);
+                let other = match pane_seg_normal(&seg) {
+                    Some((true, _)) => pane_from,
+                    Some((false, _)) => pane_to,
+                    None => pane_to,
+                };
+                match shown {
+                    Pane::Budget => {
+                        let alpha = match pane_seg_normal(&seg) {
+                            Some((_, n)) => n,
+                            None => 1.0,
+                        };
+                        ui.scope(|ui| {
+                            ui.set_opacity(alpha);
+                            let mut action: Option<BudgetAction> = None;
+                            MacroApp::budget_screen(ui, budget, &db, &mut action);
+                            budget_action = action;
+                        });
                     }
-                });
-            ui.add_space(spacing);
-            let row_w = ui.available_width();
-            ui.horizontal(|ui| {
-                if let Some(last) = specs.last() {
-                    let s = series
-                        .get(last.symbol)
-                        .cloned()
-                        .unwrap_or_default();
-                    MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
+                    Pane::ChatMax => {
+                        let mut rect = full;
+                        let mut alpha = 1.0;
+                        match pane_seg_normal(&seg) {
+                            Some((_, n)) => {
+                                if other == Pane::Dashboard {
+                                    let n_grid = specs.len().saturating_sub(1).min(9);
+                                    let slot = pane_chat_slot(full, specs.len(), n_grid);
+                                    rect = pane_interp_rect(slot, full, n);
+                                } else {
+                                    alpha = n;
+                                }
+                            }
+                            None => {}
+                        }
+                        ui.scope(|ui| {
+                            ui.set_opacity(alpha);
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                MacroApp::chat_panel(
+                                    ui,
+                                    chat,
+                                    true,
+                                    rect.width(),
+                                    rect.height(),
+                                    anim_active,
+                                    &mut chat_send,
+                                    &mut chat_clear,
+                                    &mut chat_toggle,
+                                    &mut custom_model,
+                                );
+                            });
+                        });
+                    }
+                    Pane::Dashboard => {
+                        let chat_only = other == Pane::ChatMax;
+                        let alpha = match pane_seg_normal(&seg) {
+                            Some((_, n)) => n,
+                            None => 1.0,
+                        };
+                        let chat_alpha = if chat_only { 1.0 } else { alpha };
+                        let spacing = 12.0;
+                        let cols = 3usize;
+                        let total_rows = specs.len().div_ceil(cols);
+                        let avail_w = ui.available_width();
+                        let avail_h = ui.available_height();
+                        let card_w =
+                            (((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32) - 2.0).max(180.0);
+                        let card_h = ((avail_h - spacing * total_rows as f32) / total_rows as f32)
+                            .max(140.0);
+                        let plot_w = card_w - 16.0;
+                        let plot_h = (card_h - 84.0).max(30.0);
+                        let grid_specs = &specs[..specs.len().saturating_sub(1).min(9)];
+                        ui.scope(|ui| {
+                            ui.set_opacity(alpha);
+                            egui::Grid::new("dashboard_grid")
+                                .num_columns(cols)
+                                .spacing([spacing, spacing])
+                                .min_col_width(card_w)
+                                .show(ui, |ui| {
+                                    for (i, spec) in grid_specs.iter().enumerate() {
+                                        let s = series
+                                            .get(spec.symbol)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
+                                        if i % cols == cols - 1 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        });
+                        ui.add_space(spacing);
+                        let row_w = ui.available_width();
+                        ui.horizontal(|ui| {
+                            ui.scope(|ui| {
+                                ui.set_opacity(alpha);
+                                if let Some(last) = specs.last() {
+                                    let s = series
+                                        .get(last.symbol)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
+                                }
+                            });
+                            ui.add_space((spacing - 8.0).max(0.0));
+                            ui.scope(|ui| {
+                                ui.set_opacity(chat_alpha);
+                                let chat_w = (row_w - card_w - 2.0 * spacing - 10.0).max(160.0);
+                                MacroApp::chat_panel(
+                                    ui,
+                                    chat,
+                                    false,
+                                    chat_w,
+                                    card_h,
+                                    anim_active,
+                                    &mut chat_send,
+                                    &mut chat_clear,
+                                    &mut chat_toggle,
+                                    &mut custom_model,
+                                );
+                            });
+                        });
+                    }
                 }
-                ui.add_space((spacing - 8.0).max(0.0));
-                let chat_w = (row_w - card_w - 2.0 * spacing - 10.0).max(160.0);
-                MacroApp::chat_panel(
-                    ui,
-                    chat,
-                    false,
-                    chat_w,
-                    card_h,
-                    &mut chat_send,
-                    &mut chat_clear,
-                    &mut chat_toggle,
-                    &mut custom_model,
-                );
             });
+            if !pane_running(ui, pane_from, pane_to) {
+                self.pane_from = pane_to;
+            }
         });
 
         match std::mem::replace(&mut self.dialog_state, DialogState::None) {
