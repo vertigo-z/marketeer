@@ -96,16 +96,16 @@ impl Country {
 
     fn index_symbol(&self) -> &'static str {
         match self {
-            Country::Australia => "ASX200",
+            Country::Australia => "XJO",
             Country::Usa => "SP500",
-            Country::China => "SSECOMP",
-            Country::Japan => "NIKKEI225",
-            Country::India => "NIFTY50",
-            Country::Uk => "FTSE100",
-            Country::Germany => "DAX40",
-            Country::Canada => "TSXCOMP",
-            Country::Russia => "MOEX",
-            Country::SouthKorea => "KOSPI",
+            Country::China => "000001",
+            Country::Japan => "N225",
+            Country::India => "NSEI",
+            Country::Uk => "FTSE",
+            Country::Germany => "DAX",
+            Country::Canada => "TSX",
+            Country::Russia => "IMOEX",
+            Country::SouthKorea => "KS11",
         }
     }
 
@@ -195,6 +195,7 @@ enum Source {
     Fred,
     Kraken,
     Lbma,
+    TwelveData,
 }
 
 impl Source {
@@ -204,6 +205,7 @@ impl Source {
             Source::Fred => "FRED",
             Source::Kraken => "Kraken",
             Source::Lbma => "LBMA",
+            Source::TwelveData => "Twelve Data",
         }
     }
 }
@@ -219,6 +221,11 @@ struct SeriesSpec {
 }
 
 fn registry(country: Country) -> Vec<SeriesSpec> {
+    let index = if country == Country::Usa {
+        SeriesSpec { symbol: "SP500", title: "S&P 500", unit: "", source: Source::Fred, market: true, yoy: false }
+    } else {
+        SeriesSpec { symbol: country.index_symbol(), title: country.index_title(), unit: "", source: Source::TwelveData, market: true, yoy: false }
+    };
     let cpi = if country == Country::Australia {
         SeriesSpec { symbol: "AUSCPIALLQINMEI", title: "AU CPI (YoY)", unit: "%", source: Source::Fred, market: false, yoy: true }
     } else {
@@ -226,7 +233,7 @@ fn registry(country: Country) -> Vec<SeriesSpec> {
     };
     vec![
         SeriesSpec { symbol: country.fx_symbol(), title: country.fx_title(), unit: "", source: Source::Frankfurter, market: true, yoy: false },
-        SeriesSpec { symbol: "SP500", title: "S&P 500", unit: "", source: Source::Fred, market: true, yoy: false },
+        index,
         SeriesSpec { symbol: "NASDAQCOM", title: "NASDAQ Composite", unit: "", source: Source::Fred, market: true, yoy: false },
         SeriesSpec { symbol: "DJIA", title: "Dow Jones (DJIA)", unit: "", source: Source::Fred, market: true, yoy: false },
         SeriesSpec { symbol: "GOLD", title: "Gold (LBMA PM)", unit: "USD/oz", source: Source::Lbma, market: false, yoy: false },
@@ -483,6 +490,7 @@ fn parse_kraken_ticker(body: &str) -> Option<f64> {
 #[derive(Clone, Default)]
 struct ApiKeys {
     fred: String,
+    twelve: String,
 }
 
 fn parse_kraken_ohlc_ts(body: &str) -> Vec<(f64, f64)> {
@@ -552,6 +560,30 @@ fn fred_yoy(obs: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f64)> {
     out
 }
 
+fn parse_twelve(body: &str) -> Vec<(NaiveDate, f64)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(values) = v["values"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in values {
+        let (Some(d), Some(c)) = (item["datetime"].as_str(), item["close"].as_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(&d[..10.min(d.len())], "%Y-%m-%d") else {
+            continue;
+        };
+        let Ok(close) = c.parse::<f64>() else {
+            continue;
+        };
+        out.push((date, close));
+    }
+    out.sort_by_key(|(d, _)| *d);
+    out
+}
+
 fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec<(NaiveDate, f64)>, String> {
     match spec.source {
         Source::Frankfurter => {
@@ -588,6 +620,25 @@ fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec
                     return Err("no data after YoY transform".into());
                 }
                 return Ok(yoy);
+            }
+            Ok(obs)
+        }
+        Source::TwelveData => {
+            if keys.twelve.trim().is_empty() {
+                return Err("Twelve Data API key not set (Settings)".into());
+            }
+            let url = format!(
+                "https://api.twelvedata.com/time_series?symbol={}&interval=1day&outputsize=5000&apikey={}",
+                spec.symbol,
+                keys.twelve.trim()
+            );
+            let body = http_get(&url)?;
+            let obs: Vec<(NaiveDate, f64)> = parse_twelve(&body)
+                .into_iter()
+                .filter(|(d, _)| d.year() >= from_year)
+                .collect();
+            if obs.is_empty() {
+                return Err("no data returned".into());
             }
             Ok(obs)
         }
@@ -2002,6 +2053,7 @@ fn spawn_worker(
     specs: Vec<SeriesSpec>,
     keys: ApiKeys,
     market_refresh: u64,
+    auto_refresh: bool,
     db_mutex: Arc<Mutex<Connection>>,
     tx: mpsc::Sender<DataEvent>,
 ) -> WorkerHandle {
@@ -2036,7 +2088,7 @@ fn spawn_worker(
             let manual = manual_trigger.swap(false, Ordering::Relaxed);
 
             // Live quotes: kraken tickers (crypto + AUD/USD)
-            if manual || last_quotes.elapsed() >= quote_iv {
+            if manual || (auto_refresh && last_quotes.elapsed() >= quote_iv) {
                 for spec in specs
                     .iter()
                     .filter(|s| s.market && matches!(s.source, Source::Kraken | Source::Frankfurter))
@@ -2104,7 +2156,7 @@ fn spawn_worker(
                 let due = manual
                     || last_history
                         .get(spec.symbol)
-                        .map(|t| t.elapsed() >= iv)
+                        .map(|t| auto_refresh && t.elapsed() >= iv)
                         .unwrap_or(true);
                 if !due {
                     continue;
@@ -2339,6 +2391,7 @@ enum DialogState {
     None,
     Settings {
         fred_key: String,
+        twelve_key: String,
         llm_base_url: String,
         llm_key: String,
         llm_model: String,
@@ -2377,12 +2430,22 @@ fn pane_noop(_ui: &mut egui::Ui, _normal: f32) {}
 
 const PANE_ANIM: Animation<Sequence> = Animation::from_segments(
     AnimationSegment::new(0.0975, pane_noop),
-    AnimationSegment::new(0.165, pane_noop),
+    AnimationSegment::new(0.18, pane_noop),
 );
 
 const PANE_SHRINK: Animation<Sequence> = Animation::from_segments(
-    AnimationSegment::new(0.165, pane_noop),
+    AnimationSegment::new(0.18, pane_noop),
     AnimationSegment::new(0.0975, pane_noop),
+);
+
+const PANE_INSTANT: Animation<Sequence> = Animation::from_segments(
+    AnimationSegment::new(0.0, pane_noop),
+    AnimationSegment::new(0.0, pane_noop),
+);
+
+const PANE_SLIDE: Animation<Sequence> = Animation::from_segments(
+    AnimationSegment::new(0.18, pane_noop),
+    AnimationSegment::new(0.0, pane_noop),
 );
 
 const CONTROLS_ANIM: Animation<Sequence> = Animation::from_segments(
@@ -2393,12 +2456,13 @@ const CONTROLS_ANIM: Animation<Sequence> = Animation::from_segments(
 fn pane_anim(from: Pane, to: Pane) -> Animation<Sequence> {
     match (from, to) {
         (Pane::ChatMax, Pane::Dashboard) => PANE_SHRINK,
+        (Pane::Dashboard, Pane::Budget) | (Pane::Budget, Pane::Dashboard) => PANE_SLIDE,
         _ => PANE_ANIM,
     }
 }
 
-fn pane_running(ui: &mut egui::Ui, from: Pane, to: Pane) -> bool {
-    run_state(ui, "pane_anim", pane_anim(from, to)).is_running()
+fn pane_running(ui: &mut egui::Ui, from: Pane, to: Pane, enabled: bool) -> bool {
+    enabled && run_state(ui, "pane_anim", pane_anim(from, to)).is_running()
 }
 
 fn pane_seg_normal(seg: &SequenceRunState) -> Option<(bool, f32)> {
@@ -2449,6 +2513,9 @@ struct MacroApp {
     chat: ChatState,
     chat_maximized: bool,
     pane_from: Pane,
+    animations: bool,
+    auto_refresh: bool,
+    chat_rect: Option<egui::Rect>,
     budget: BudgetState,
     current_tab: String,
     llm_base_url: String,
@@ -2487,8 +2554,11 @@ impl MacroApp {
 
         let keys = ApiKeys {
             fred: config_get(&conn, "fred_key"),
+            twelve: config_get(&conn, "twelve_key"),
         };
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
+        let auto_refresh = config_get(&conn, "auto_refresh") != "0";
+        let animations = config_get(&conn, "animations") != "0";
         let range = match config_get(&conn, "range").as_str() {
             "1D" => Range::D1,
             "1W" => Range::W1,
@@ -2551,6 +2621,7 @@ impl MacroApp {
             specs.clone(),
             keys,
             refresh_mins * 60,
+            auto_refresh,
             db.clone(),
             chat_tx.clone(),
         );
@@ -2567,6 +2638,9 @@ impl MacroApp {
             chat,
             chat_maximized: false,
             pane_from: if current_tab == "Budget" { Pane::Budget } else { Pane::Dashboard },
+            animations,
+            auto_refresh,
+            chat_rect: None,
             budget,
             current_tab,
             llm_base_url,
@@ -2758,8 +2832,10 @@ impl MacroApp {
         self.series = series;
         let keys = ApiKeys {
             fred: config_get(&conn, "fred_key"),
+            twelve: config_get(&conn, "twelve_key"),
         };
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
+        let auto_refresh = config_get(&conn, "auto_refresh") != "0";
         drop(conn);
         self.worker.stop();
         self.worker = spawn_worker(
@@ -2767,6 +2843,7 @@ impl MacroApp {
             self.specs.clone(),
             keys,
             refresh_mins * 60,
+            auto_refresh,
             self.db.clone(),
             self.chat_tx.clone(),
         );
@@ -3066,11 +3143,11 @@ impl MacroApp {
         clear: &mut bool,
         toggle_max: &mut bool,
         custom_model: &mut bool,
-    ) {
+    ) -> egui::Rect {
         let right = ui.max_rect().right().min(ui.clip_rect().right());
         let width = width.min((right - ui.next_widget_position().x - 18.0).max(1.0));
         let height = height.min(ui.available_height());
-        egui::Frame::group(ui.style())
+        let frame = egui::Frame::group(ui.style())
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |parent| {
@@ -3239,6 +3316,7 @@ impl MacroApp {
                     });
                 });
             });
+        frame.response.rect
     }
 
     fn budget_section(
@@ -3689,14 +3767,49 @@ impl MacroApp {
                     }
                 });
                 ui.menu_button("Settings", |ui| {
+                    if ui.checkbox(&mut self.auto_refresh, "automatic refresh").changed() {
+                        let (keys, refresh_mins) = if let Ok(conn) = self.db.lock() {
+                            config_set(
+                                &conn,
+                                "auto_refresh",
+                                if self.auto_refresh { "1" } else { "0" },
+                            );
+                            (
+                                ApiKeys {
+                                    fred: config_get(&conn, "fred_key"),
+                                    twelve: config_get(&conn, "twelve_key"),
+                                },
+                                config_get(&conn, "refresh_mins").parse().unwrap_or(1),
+                            )
+                        } else {
+                            (
+                                ApiKeys {
+                                    fred: String::new(),
+                                    twelve: String::new(),
+                                },
+                                1,
+                            )
+                        };
+                        self.worker.stop();
+                        self.worker = spawn_worker(
+                            ui.ctx().clone(),
+                            self.specs.clone(),
+                            keys,
+                            refresh_mins * 60,
+                            self.auto_refresh,
+                            self.db.clone(),
+                            self.chat_tx.clone(),
+                        );
+                    }
                      if ui.button("API Keys").clicked() {
-                        let (fred_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
+                        let (fred_key, twelve_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
                             .db
                             .lock()
                             .ok()
                             .map(|conn| {
                                 (
                                     config_get(&conn, "fred_key"),
+                                    config_get(&conn, "twelve_key"),
                                     config_get(&conn, "llm_base_url"),
                                     config_get(&conn, "llm_key"),
                                     config_get(&conn, "llm_model"),
@@ -3707,6 +3820,7 @@ impl MacroApp {
                             .unwrap_or_else(|| {
                                 (
                                     String::new(),
+                                    String::new(),
                                     "https://openrouter.ai/api/v1".into(),
                                     String::new(),
                                     String::new(),
@@ -3716,6 +3830,7 @@ impl MacroApp {
                             });
                         self.dialog_state = DialogState::Settings {
                             fred_key,
+                            twelve_key,
                             llm_base_url,
                             llm_key,
                             llm_model,
@@ -3742,6 +3857,11 @@ impl MacroApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.checkbox(&mut self.animations, "animations").changed() {
+                        if let Ok(conn) = self.db.lock() {
+                            config_set(&conn, "animations", if self.animations { "1" } else { "0" });
+                        }
+                    }
                     ui.menu_button("Budget", |ui| {
                         if ui
                             .checkbox(&mut self.budget.count_oneoff, "count one-off in spending")
@@ -3801,7 +3921,8 @@ impl MacroApp {
     fn show_controls(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("controls").show(ui, |ui| {
             let is_budget = self.current_tab == "Budget";
-            animate(ui, "controls_anim", is_budget, CONTROLS_ANIM, |ui, is_budget| {
+            let controls_anim = if self.animations { CONTROLS_ANIM } else { PANE_INSTANT };
+            animate(ui, "controls_anim", is_budget, controls_anim, |ui, is_budget| {
                 if is_budget {
                     ui.horizontal(|ui| {
                         ui.heading("Budget");
@@ -4019,7 +4140,11 @@ impl eframe::App for MacroApp {
             } else {
                 Pane::Dashboard
             };
-            let anim = pane_anim(pane_from, pane_to);
+            let anim = if self.animations {
+                pane_anim(pane_from, pane_to)
+            } else {
+                PANE_INSTANT
+            };
             let specs = self.specs.clone();
             let series = &self.series;
             let chat = &mut self.chat;
@@ -4027,35 +4152,43 @@ impl eframe::App for MacroApp {
             let db = self.db.clone();
             let range = self.range;
             let full = ui.available_rect_before_wrap();
-            let anim_active = pane_running(ui, pane_from, pane_to);
-            animate(ui, "pane_anim", pane_to, anim, |ui, shown| {
-                let seg = run_state(ui, "pane_anim", anim);
-                let other = match pane_seg_normal(&seg) {
-                    Some((true, _)) => pane_from,
-                    Some((false, _)) => pane_to,
-                    None => pane_to,
-                };
+            let chat_rect = self.chat_rect;
+            let mut chat_rect_out: Option<egui::Rect> = None;
+            let anim_active = pane_running(ui, pane_from, pane_to, self.animations);
+            let mut render = |ui: &mut egui::Ui,
+                              shown: Pane,
+                              other: Pane,
+                              seg: &SequenceRunState,
+                              x_off: f32| {
                 match shown {
                     Pane::Budget => {
-                        let alpha = match pane_seg_normal(&seg) {
+                        let seg_n = match pane_seg_normal(seg) {
                             Some((_, n)) => n,
                             None => 1.0,
                         };
-                        ui.scope(|ui| {
-                            ui.set_opacity(alpha);
-                            let mut action: Option<BudgetAction> = None;
-                            MacroApp::budget_screen(ui, budget, &db, &mut action);
-                            budget_action = action;
-                        });
+                        let alpha = if other == Pane::Dashboard { 1.0 } else { seg_n };
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(full.translate(egui::vec2(x_off, 0.0))),
+                            |ui| {
+                                ui.scope(|ui| {
+                                    ui.set_opacity(alpha);
+                                    let mut action: Option<BudgetAction> = None;
+                                    MacroApp::budget_screen(ui, budget, &db, &mut action);
+                                    budget_action = action;
+                                });
+                            },
+                        );
                     }
                     Pane::ChatMax => {
                         let mut rect = full;
                         let mut alpha = 1.0;
-                        match pane_seg_normal(&seg) {
+                        match pane_seg_normal(seg) {
                             Some((_, n)) => {
                                 if other == Pane::Dashboard {
                                     let n_grid = specs.len().saturating_sub(1).min(9);
-                                    let slot = pane_chat_slot(full, specs.len(), n_grid);
+                                    let slot = chat_rect
+                                        .unwrap_or_else(|| pane_chat_slot(full, specs.len(), n_grid));
                                     rect = pane_interp_rect(slot, full, n);
                                 } else {
                                     alpha = n;
@@ -4083,77 +4216,115 @@ impl eframe::App for MacroApp {
                     }
                     Pane::Dashboard => {
                         let chat_only = other == Pane::ChatMax;
-                        let alpha = match pane_seg_normal(&seg) {
+                        let seg_n = match pane_seg_normal(seg) {
                             Some((_, n)) => n,
                             None => 1.0,
                         };
+                        let alpha = if chat_only { seg_n } else { 1.0 };
                         let chat_alpha = if chat_only { 1.0 } else { alpha };
-                        let spacing = 12.0;
-                        let cols = 3usize;
-                        let total_rows = specs.len().div_ceil(cols);
-                        let avail_w = ui.available_width();
-                        let avail_h = ui.available_height();
-                        let card_w =
-                            (((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32) - 2.0).max(180.0);
-                        let card_h = ((avail_h - spacing * total_rows as f32) / total_rows as f32)
-                            .max(140.0);
-                        let plot_w = card_w - 16.0;
-                        let plot_h = (card_h - 84.0).max(30.0);
-                        let grid_specs = &specs[..specs.len().saturating_sub(1).min(9)];
-                        ui.scope(|ui| {
-                            ui.set_opacity(alpha);
-                            egui::Grid::new("dashboard_grid")
-                                .num_columns(cols)
-                                .spacing([spacing, spacing])
-                                .min_col_width(card_w)
-                                .show(ui, |ui| {
-                                    for (i, spec) in grid_specs.iter().enumerate() {
-                                        let s = series
-                                            .get(spec.symbol)
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
-                                        if i % cols == cols - 1 {
-                                            ui.end_row();
-                                        }
-                                    }
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(full.translate(egui::vec2(x_off, 0.0))),
+                            |ui| {
+                                let spacing = 12.0;
+                                let cols = 3usize;
+                                let total_rows = specs.len().div_ceil(cols);
+                                let avail_w = ui.available_width();
+                                let avail_h = ui.available_height();
+                                let card_w = (((avail_w - spacing * (cols as f32 - 1.0))
+                                    / cols as f32)
+                                    - 2.0)
+                                    .max(180.0);
+                                let card_h = ((avail_h - spacing * total_rows as f32)
+                                    / total_rows as f32)
+                                    .max(140.0);
+                                let plot_w = card_w - 16.0;
+                                let plot_h = (card_h - 84.0).max(30.0);
+                                let grid_specs = &specs[..specs.len().saturating_sub(1).min(9)];
+                                ui.scope(|ui| {
+                                    ui.set_opacity(alpha);
+                                    egui::Grid::new("dashboard_grid")
+                                        .num_columns(cols)
+                                        .spacing([spacing, spacing])
+                                        .min_col_width(card_w)
+                                        .show(ui, |ui| {
+                                            for (i, spec) in grid_specs.iter().enumerate() {
+                                                let s = series
+                                                    .get(spec.symbol)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
+                                                if i % cols == cols - 1 {
+                                                    ui.end_row();
+                                                }
+                                            }
+                                        });
                                 });
-                        });
-                        ui.add_space(spacing);
-                        let row_w = ui.available_width();
-                        ui.horizontal(|ui| {
-                            ui.scope(|ui| {
-                                ui.set_opacity(alpha);
-                                if let Some(last) = specs.last() {
-                                    let s = series
-                                        .get(last.symbol)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
-                                }
-                            });
-                            ui.add_space((spacing - 8.0).max(0.0));
-                            ui.scope(|ui| {
-                                ui.set_opacity(chat_alpha);
-                                let chat_w = (row_w - card_w - 2.0 * spacing - 10.0).max(160.0);
-                                MacroApp::chat_panel(
-                                    ui,
-                                    chat,
-                                    false,
-                                    chat_w,
-                                    card_h,
-                                    anim_active,
-                                    &mut chat_send,
-                                    &mut chat_clear,
-                                    &mut chat_toggle,
-                                    &mut custom_model,
-                                );
-                            });
-                        });
+                                ui.add_space(spacing);
+                                let row_w = ui.available_width();
+                                ui.horizontal(|ui| {
+                                    ui.scope(|ui| {
+                                        ui.set_opacity(alpha);
+                                        if let Some(last) = specs.last() {
+                                            let s = series
+                                                .get(last.symbol)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            MacroApp::stat_card(ui, &s, range, plot_w, plot_h);
+                                        }
+                                    });
+                                    ui.add_space((spacing - 8.0).max(0.0));
+                                    ui.scope(|ui| {
+                                        ui.set_opacity(chat_alpha);
+                                        let chat_w =
+                                            (row_w - card_w - 2.0 * spacing - 10.0).max(160.0);
+                                        let rect = MacroApp::chat_panel(
+                                            ui,
+                                            chat,
+                                            false,
+                                            chat_w,
+                                            card_h,
+                                            anim_active,
+                                            &mut chat_send,
+                                            &mut chat_clear,
+                                            &mut chat_toggle,
+                                            &mut custom_model,
+                                        );
+                                        chat_rect_out = Some(rect);
+                                    });
+                                });
+                            },
+                        );
                     }
                 }
+            };
+            animate(ui, "pane_anim", pane_to, anim, |ui, shown| {
+                let seg = run_state(ui, "pane_anim", anim);
+                let other = match pane_seg_normal(&seg) {
+                    Some((true, _)) => pane_from,
+                    Some((false, _)) => pane_to,
+                    None => pane_to,
+                };
+                let tab_slide = matches!(
+                    (pane_from, pane_to),
+                    (Pane::Dashboard, Pane::Budget) | (Pane::Budget, Pane::Dashboard)
+                );
+                if let SequenceRunState::OutSeg(n) = seg {
+                    if tab_slide {
+                        let t = egui::emath::easing::cubic_out(1.0 - n);
+                        let w = full.width();
+                        let dir = if pane_to == Pane::Budget { 1.0 } else { -1.0 };
+                        render(ui, pane_from, pane_to, &seg, -dir * t * w);
+                        render(ui, pane_to, pane_from, &seg, dir * (1.0 - t) * w);
+                        return;
+                    }
+                }
+                render(ui, shown, other, &seg, 0.0);
             });
-            if !pane_running(ui, pane_from, pane_to) {
+            if let Some(r) = chat_rect_out {
+                self.chat_rect = Some(r);
+            }
+            if !pane_running(ui, pane_from, pane_to, self.animations) {
                 self.pane_from = pane_to;
             }
         });
@@ -4162,6 +4333,7 @@ impl eframe::App for MacroApp {
             DialogState::None => {}
             DialogState::Settings {
                 mut fred_key,
+                mut twelve_key,
                 mut llm_base_url,
                 mut llm_key,
                 mut llm_model,
@@ -4184,6 +4356,18 @@ impl eframe::App for MacroApp {
                         });
                         ui.add(
                             egui::TextEdit::singleline(&mut fred_key)
+                                .desired_width(320.0)
+                                .password(true),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Twelve Data API Key:");
+                            if ui.small_button("copy").on_hover_text("copy key to clipboard").clicked() {
+                                ui.ctx().copy_text(twelve_key.clone());
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut twelve_key)
                                 .desired_width(320.0)
                                 .password(true),
                         );
@@ -4239,6 +4423,7 @@ impl eframe::App for MacroApp {
                 if save {
                     if let Ok(conn) = self.db.lock() {
                         config_set(&conn, "fred_key", fred_key.trim());
+                        config_set(&conn, "twelve_key", twelve_key.trim());
                         config_set(&conn, "llm_base_url", llm_base_url.trim());
                         config_set(&conn, "llm_key", llm_key.trim());
                         config_set(&conn, "llm_model", llm_model.trim());
@@ -4256,6 +4441,7 @@ impl eframe::App for MacroApp {
                 } else if open {
                     self.dialog_state = DialogState::Settings {
                         fred_key,
+                        twelve_key,
                         llm_base_url,
                         llm_key,
                         llm_model,
