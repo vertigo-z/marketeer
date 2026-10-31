@@ -156,17 +156,21 @@ impl Country {
 
     fn cpi_symbol(&self) -> &'static str {
         match self {
-            Country::Australia => "CPALTT01AUSM659N",
+            Country::Australia => "AUSCPIALLQINMEI",
             Country::Usa => "CPALTT01USM659N",
-            Country::China => "CPALTT01CHNM659N",
-            Country::Japan => "CPALTT01JPNM659N",
-            Country::India => "CPALTT01INDM659N",
-            Country::Uk => "CPALTT01GBRM659N",
-            Country::Germany => "CPALTT01DEUM659N",
-            Country::Canada => "CPALTT01CANM659N",
-            Country::Russia => "CPALTT01RUSM659N",
-            Country::SouthKorea => "CPALTT01KORM659N",
+            Country::China => "CHNCPIALLMINMEI",
+            Country::Japan => "JPNCPIALLMINMEI",
+            Country::India => "INDCPIALLMINMEI",
+            Country::Uk => "GBRCPIALLMINMEI",
+            Country::Germany => "DEUCPIALLMINMEI",
+            Country::Canada => "CANCPIALLMINMEI",
+            Country::Russia => "RUSCPIALLMINMEI",
+            Country::SouthKorea => "KORCPIALLMINMEI",
         }
+    }
+
+    fn cpi_yoy(&self) -> bool {
+        self != &Country::Usa
     }
 
     fn cpi_title(&self) -> &'static str {
@@ -230,10 +234,13 @@ fn registry(country: Country) -> Vec<SeriesSpec> {
     } else {
         SeriesSpec { symbol: country.index_symbol(), title: country.index_title(), unit: "", source: Source::TwelveData, market: true, yoy: false }
     };
-    let cpi = if country == Country::Australia {
-        SeriesSpec { symbol: "AUSCPIALLQINMEI", title: "AU CPI (YoY)", unit: "%", source: Source::Fred, market: false, yoy: true }
-    } else {
-        SeriesSpec { symbol: country.cpi_symbol(), title: country.cpi_title(), unit: "%", source: Source::Fred, market: false, yoy: false }
+    let cpi = SeriesSpec {
+        symbol: country.cpi_symbol(),
+        title: country.cpi_title(),
+        unit: "%",
+        source: Source::Fred,
+        market: false,
+        yoy: country.cpi_yoy(),
     };
     vec![
         SeriesSpec { symbol: country.fx_symbol(), title: country.fx_title(), unit: "", source: Source::Frankfurter, market: true, yoy: false },
