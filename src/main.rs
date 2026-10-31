@@ -196,6 +196,7 @@ enum Source {
     Kraken,
     Lbma,
     TwelveData,
+    SmApi,
 }
 
 impl Source {
@@ -206,6 +207,7 @@ impl Source {
             Source::Kraken => "Kraken",
             Source::Lbma => "LBMA",
             Source::TwelveData => "Twelve Data",
+            Source::SmApi => "StockMarketAPI",
         }
     }
 }
@@ -223,6 +225,8 @@ struct SeriesSpec {
 fn registry(country: Country) -> Vec<SeriesSpec> {
     let index = if country == Country::Usa {
         SeriesSpec { symbol: "SP500", title: "S&P 500", unit: "", source: Source::Fred, market: true, yoy: false }
+    } else if country == Country::Australia {
+        SeriesSpec { symbol: "ASX200", title: "ASX 200", unit: "", source: Source::SmApi, market: true, yoy: false }
     } else {
         SeriesSpec { symbol: country.index_symbol(), title: country.index_title(), unit: "", source: Source::TwelveData, market: true, yoy: false }
     };
@@ -491,6 +495,7 @@ fn parse_kraken_ticker(body: &str) -> Option<f64> {
 struct ApiKeys {
     fred: String,
     twelve: String,
+    smapi: String,
 }
 
 fn parse_kraken_ohlc_ts(body: &str) -> Vec<(f64, f64)> {
@@ -584,6 +589,27 @@ fn parse_twelve(body: &str) -> Vec<(NaiveDate, f64)> {
     out
 }
 
+fn parse_smapi(body: &str) -> Vec<(NaiveDate, f64)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(bars) = v["bars"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in bars {
+        let (Some(t), Some(c)) = (item["t"].as_str(), item["close"].as_f64()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(t, "%Y-%m-%d") else {
+            continue;
+        };
+        out.push((date, c));
+    }
+    out.sort_by_key(|(d, _)| *d);
+    out
+}
+
 fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec<(NaiveDate, f64)>, String> {
     match spec.source {
         Source::Frankfurter => {
@@ -620,6 +646,24 @@ fn fetch_series(spec: &SeriesSpec, keys: &ApiKeys, from_year: i32) -> Result<Vec
                     return Err("no data after YoY transform".into());
                 }
                 return Ok(yoy);
+            }
+            Ok(obs)
+        }
+        Source::SmApi => {
+            if keys.smapi.trim().is_empty() {
+                return Err("StockMarketAPI key not set (Settings)".into());
+            }
+            let url = format!(
+                "https://stockmarketapi.ai/api/v1/indices/{}/prices?range=MAX",
+                spec.symbol
+            );
+            let body = http_get_key(&url, keys.smapi.trim())?;
+            let obs: Vec<(NaiveDate, f64)> = parse_smapi(&body)
+                .into_iter()
+                .filter(|(d, _)| d.year() >= from_year)
+                .collect();
+            if obs.is_empty() {
+                return Err("no data returned".into());
             }
             Ok(obs)
         }
@@ -688,6 +732,7 @@ fn yahoo_intraday_ticker(symbol: &str) -> Option<&'static str> {
         "RUBUSD" => Some("RUBUSD=X"),
         "KRWUSD" => Some("KRWUSD=X"),
         "SP500" => Some("^GSPC"),
+        "ASX200" => Some("^AXJO"),
         "NASDAQCOM" => Some("^IXIC"),
         "NIKKEI225" => Some("^N225"),
         "DJIA" => Some("^DJI"),
@@ -921,6 +966,24 @@ fn http_get_ua(url: &str, timeout_secs: u64) -> Result<String, String> {
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
         )
+        .call()
+        .map_err(|e| e.to_string())?;
+    let mut body = String::new();
+    resp.into_body()
+        .into_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+fn http_get_key(url: &str, api_key: &str) -> Result<String, String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let resp = agent
+        .get(url)
+        .header("X-API-Key", api_key)
         .call()
         .map_err(|e| e.to_string())?;
     let mut body = String::new();
@@ -2392,6 +2455,7 @@ enum DialogState {
     Settings {
         fred_key: String,
         twelve_key: String,
+        smapi_key: String,
         llm_base_url: String,
         llm_key: String,
         llm_model: String,
@@ -2555,6 +2619,7 @@ impl MacroApp {
         let keys = ApiKeys {
             fred: config_get(&conn, "fred_key"),
             twelve: config_get(&conn, "twelve_key"),
+            smapi: config_get(&conn, "smapi_key"),
         };
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
         let auto_refresh = config_get(&conn, "auto_refresh") != "0";
@@ -2833,6 +2898,7 @@ impl MacroApp {
         let keys = ApiKeys {
             fred: config_get(&conn, "fred_key"),
             twelve: config_get(&conn, "twelve_key"),
+            smapi: config_get(&conn, "smapi_key"),
         };
         let refresh_mins: u64 = config_get(&conn, "refresh_mins").parse().unwrap_or(1);
         let auto_refresh = config_get(&conn, "auto_refresh") != "0";
@@ -3778,6 +3844,7 @@ impl MacroApp {
                                 ApiKeys {
                                     fred: config_get(&conn, "fred_key"),
                                     twelve: config_get(&conn, "twelve_key"),
+                                    smapi: config_get(&conn, "smapi_key"),
                                 },
                                 config_get(&conn, "refresh_mins").parse().unwrap_or(1),
                             )
@@ -3786,6 +3853,7 @@ impl MacroApp {
                                 ApiKeys {
                                     fred: String::new(),
                                     twelve: String::new(),
+                                    smapi: String::new(),
                                 },
                                 1,
                             )
@@ -3802,7 +3870,7 @@ impl MacroApp {
                         );
                     }
                      if ui.button("API Keys").clicked() {
-                        let (fred_key, twelve_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
+                        let (fred_key, twelve_key, smapi_key, llm_base_url, llm_key, llm_model, refresh_mins, brave_key) = self
                             .db
                             .lock()
                             .ok()
@@ -3810,6 +3878,7 @@ impl MacroApp {
                                 (
                                     config_get(&conn, "fred_key"),
                                     config_get(&conn, "twelve_key"),
+                                    config_get(&conn, "smapi_key"),
                                     config_get(&conn, "llm_base_url"),
                                     config_get(&conn, "llm_key"),
                                     config_get(&conn, "llm_model"),
@@ -3819,6 +3888,7 @@ impl MacroApp {
                             })
                             .unwrap_or_else(|| {
                                 (
+                                    String::new(),
                                     String::new(),
                                     String::new(),
                                     "https://openrouter.ai/api/v1".into(),
@@ -3831,6 +3901,7 @@ impl MacroApp {
                         self.dialog_state = DialogState::Settings {
                             fred_key,
                             twelve_key,
+                            smapi_key,
                             llm_base_url,
                             llm_key,
                             llm_model,
@@ -4334,6 +4405,7 @@ impl eframe::App for MacroApp {
             DialogState::Settings {
                 mut fred_key,
                 mut twelve_key,
+                mut smapi_key,
                 mut llm_base_url,
                 mut llm_key,
                 mut llm_model,
@@ -4368,6 +4440,18 @@ impl eframe::App for MacroApp {
                         });
                         ui.add(
                             egui::TextEdit::singleline(&mut twelve_key)
+                                .desired_width(320.0)
+                                .password(true),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("StockMarketAPI Key:");
+                            if ui.small_button("copy").on_hover_text("copy key to clipboard").clicked() {
+                                ui.ctx().copy_text(smapi_key.clone());
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut smapi_key)
                                 .desired_width(320.0)
                                 .password(true),
                         );
@@ -4424,6 +4508,7 @@ impl eframe::App for MacroApp {
                     if let Ok(conn) = self.db.lock() {
                         config_set(&conn, "fred_key", fred_key.trim());
                         config_set(&conn, "twelve_key", twelve_key.trim());
+                        config_set(&conn, "smapi_key", smapi_key.trim());
                         config_set(&conn, "llm_base_url", llm_base_url.trim());
                         config_set(&conn, "llm_key", llm_key.trim());
                         config_set(&conn, "llm_model", llm_model.trim());
@@ -4442,6 +4527,7 @@ impl eframe::App for MacroApp {
                     self.dialog_state = DialogState::Settings {
                         fred_key,
                         twelve_key,
+                        smapi_key,
                         llm_base_url,
                         llm_key,
                         llm_model,
